@@ -12,7 +12,6 @@ import { createInterface } from 'node:readline'
 import { writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
-import { listBridgeMcpServerStatuses } from './mcpServerStatus.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes, initializeSkillsSyncOnStartup } from './skillsRoutes.js'
 import { TelegramThreadBridge } from './telegramThreadBridge.js'
@@ -6229,13 +6228,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
         let rpcResult: unknown
         try {
-          if (body.method === 'mcpServerStatus/list') {
-            rpcResult = await listBridgeMcpServerStatuses(appServer)
-          } else if (body.method === 'config/mcpServer/reload') {
-            rpcResult = await listBridgeMcpServerStatuses(appServer, { forceRefresh: true })
-          } else {
-            rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
-          }
+          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
         } catch (error) {
 	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
 	            setJson(res, 200, { result: null })
