@@ -228,6 +228,33 @@ Rollback/cleanup:
 #### Rollback/Cleanup
 - If a branch was switched during testing, switch back to the original branch before continuing.
 
+### Feature: Fast MCP status reload for mixed stdio transports
+
+#### Prerequisites
+- App server is running from this repository on `http://127.0.0.1:4173`.
+- At least one newline-JSON MCP server (for example `beads-mcp`) and one framed stdio MCP proxy (for example `cf-portal` or `cloudflare-api`) are enabled in `~/.codex/config.toml`.
+- Light and dark themes are both available from Settings.
+
+#### Steps
+1. Open `#/skills?tab=skills` in light theme.
+2. Expand `MCPs(count)` and confirm enabled MCP cards appear instead of the empty state.
+3. Verify mixed servers show real tool/resource counts, such as non-zero counts for `beads-mcp`, `cf-portal`, and `cloudflare-api`.
+4. Click the page `Refresh` action while still on the Skills tab.
+5. Confirm the refresh completes without a long 30 second stall and the MCP cards still show their counts after the reload finishes.
+6. Trigger another refresh or navigate away and back to the Skills tab, then confirm the MCP section reloads quickly from cache.
+7. Switch to dark theme and repeat steps 1-6.
+
+#### Expected Results
+- The Skills tab MCP section no longer depends on the slow Codex CLI `mcpServerStatus/list` path for proxy-backed servers.
+- MCP status refresh works for both newline-delimited stdio servers and framed stdio proxy servers in the same config.
+- `cf-portal` and `cloudflare-api` show their cached/live tool counts instead of staying at zero or timing out.
+- `beads-mcp` still shows its tool/resource counts after the transport fallback change.
+- Repeated MCP status reads are substantially faster after the first refresh because the bridge caches server status briefly.
+- Light and dark theme MCP cards remain readable.
+
+#### Rollback/Cleanup
+- No cleanup is required beyond closing the Skills route.
+
 ### Feature: Telegram bot token stored in dedicated global file
 
 #### Prerequisites
