@@ -229,7 +229,7 @@ describe('filterGroupsByWorkspaceRoots', () => {
     ])
   })
 
-  it('keeps unregistered managed worktrees under the main root when another managed worktree root is registered', () => {
+  it('keeps registered and unregistered Codex-home worktrees under the main root', () => {
     const groups: UiProjectGroup[] = [
       {
         projectName: 'codex-web-local',
@@ -253,8 +253,67 @@ describe('filterGroupsByWorkspaceRoots', () => {
     }
 
     expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => [group.projectName, group.threads.map((row) => row.id)])).toEqual([
-      ['/Users/igor/Git-projects/codex-web-local', ['main-chat', 'unregistered-worktree-chat']],
-      ['/Users/igor/.codex/worktrees/a77f/codex-web-local', ['registered-worktree-chat']],
+      ['/Users/igor/Git-projects/codex-web-local', ['main-chat', 'registered-worktree-chat', 'unregistered-worktree-chat']],
+    ])
+  })
+
+  it('keeps registered base-checkout worktrees under the base checkout project', () => {
+    const groups: UiProjectGroup[] = [
+      {
+        projectName: 'fl2',
+        threads: [thread('main-chat', '/home/lloyd/ws/fl2')],
+      },
+      {
+        projectName: 'ccu02',
+        threads: [thread('ccu02-chat', '/home/lloyd/ws/fl2/.codex/worktrees/ccu02', { hasWorktree: true })],
+      },
+      {
+        projectName: 'gro01',
+        threads: [thread('gro01-chat', '/home/lloyd/ws/fl2/.codex/worktrees/gro01', { hasWorktree: true })],
+      },
+    ]
+    const rootsState: WorkspaceRootsState = {
+      order: [
+        '/home/lloyd/ws/fl2',
+        '/home/lloyd/ws/fl2/.codex/worktrees/ccu02',
+        '/home/lloyd/ws/fl2/.codex/worktrees/gro01',
+      ],
+      labels: {},
+      active: ['/home/lloyd/ws/fl2'],
+      projectOrder: [
+        '/home/lloyd/ws/fl2/.codex/worktrees/ccu02',
+        '/home/lloyd/ws/fl2',
+        '/home/lloyd/ws/fl2/.codex/worktrees/gro01',
+      ],
+    }
+
+    expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => [group.projectName, group.threads.map((row) => row.id)])).toEqual([
+      ['fl2', ['main-chat', 'ccu02-chat', 'gro01-chat']],
+    ])
+  })
+
+  it('shows base-checkout worktree threads under the base project even when the base has no threads', () => {
+    const groups: UiProjectGroup[] = [
+      {
+        projectName: 'ccu02',
+        threads: [thread('ccu02-chat', '/home/lloyd/ws/fl2/.codex/worktrees/ccu02', { hasWorktree: true })],
+      },
+    ]
+    const rootsState: WorkspaceRootsState = {
+      order: [
+        '/home/lloyd/ws/fl2',
+        '/home/lloyd/ws/fl2/.codex/worktrees/ccu02',
+      ],
+      labels: {},
+      active: ['/home/lloyd/ws/fl2'],
+      projectOrder: [
+        '/home/lloyd/ws/fl2/.codex/worktrees/ccu02',
+        '/home/lloyd/ws/fl2',
+      ],
+    }
+
+    expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => [group.projectName, group.threads.map((row) => row.id)])).toEqual([
+      ['fl2', ['ccu02-chat']],
     ])
   })
 
