@@ -4270,6 +4270,8 @@ function toHeaderGitResetHistoryRef(branchName: string, commitSha: string): stri
 
 const HEADER_GIT_RESET_HISTORY_REF_LIMIT = 25
 const HEADER_GIT_UNTRACKED_BACKUP_DIR = '.codex/untracked-backups'
+const PERMANENT_WORKTREE_ROOT_RELATIVE_PATH = '.codex/worktrees'
+const PERMANENT_WORKTREE_EXCLUDE_ENTRY = '/.codex/worktrees/'
 
 async function assertLocalGitBranch(repoRoot: string, branchName: string): Promise<void> {
   await runCommandCapture('git', ['show-ref', '--verify', `refs/heads/${branchName}`], { cwd: repoRoot })
@@ -4472,6 +4474,82 @@ async function allocatePermanentWorktreeBranchName(gitRoot: string, worktreeName
     if (!await doesLocalGitBranchExist(gitRoot, candidate)) return candidate
   }
   throw new Error('Failed to allocate a unique branch name for worktree')
+}
+
+type GitWorktreeListEntry = {
+  path: string
+  bare: boolean
+}
+
+function parseGitWorktreeList(raw: string): GitWorktreeListEntry[] {
+  const entries: GitWorktreeListEntry[] = []
+  let current: GitWorktreeListEntry | null = null
+
+  const flush = () => {
+    if (current?.path) {
+      entries.push(current)
+    }
+    current = null
+  }
+
+  for (const line of raw.split('\n')) {
+    if (line.trim().length === 0) {
+      flush()
+      continue
+    }
+    if (line.startsWith('worktree ')) {
+      flush()
+      current = {
+        path: line.slice('worktree '.length).trim(),
+        bare: false,
+      }
+      continue
+    }
+    if (line === 'bare' && current) {
+      current.bare = true
+    }
+  }
+  flush()
+
+  return entries
+}
+
+export function resolvePrimaryCheckoutRootFromWorktreeList(raw: string, fallbackGitRoot: string): string {
+  return parseGitWorktreeList(raw).find((entry) => !entry.bare)?.path || fallbackGitRoot
+}
+
+export function resolvePermanentWorktreeCwd(baseCheckoutRoot: string, worktreeName: string): string {
+  return join(baseCheckoutRoot, PERMANENT_WORKTREE_ROOT_RELATIVE_PATH, worktreeName)
+}
+
+async function resolvePrimaryCheckoutRoot(gitRoot: string): Promise<string> {
+  try {
+    const raw = await runCommandCapture('git', ['worktree', 'list', '--porcelain'], { cwd: gitRoot })
+    return resolvePrimaryCheckoutRootFromWorktreeList(raw, gitRoot)
+  } catch {
+    return gitRoot
+  }
+}
+
+export async function ensurePermanentWorktreeRootExcluded(baseCheckoutRoot: string): Promise<void> {
+  const excludePathRaw = await runCommandCapture('git', ['rev-parse', '--git-path', 'info/exclude'], { cwd: baseCheckoutRoot })
+  const excludePath = isAbsolute(excludePathRaw) ? excludePathRaw : join(baseCheckoutRoot, excludePathRaw)
+  let existing = ''
+  try {
+    existing = await readFile(excludePath, 'utf8')
+  } catch {
+    existing = ''
+  }
+
+  const existingEntries = existing
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'))
+  if (existingEntries.includes(PERMANENT_WORKTREE_EXCLUDE_ENTRY)) return
+
+  const separator = existing.length > 0 && !existing.endsWith('\n') ? '\n' : ''
+  await mkdir(dirname(excludePath), { recursive: true })
+  await writeFile(excludePath, `${existing}${separator}${PERMANENT_WORKTREE_EXCLUDE_ENTRY}\n`, 'utf8')
 }
 
 async function runCommandWithOutput(command: string, args: string[], options: { cwd?: string } = {}): Promise<string> {
@@ -8609,7 +8687,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             await runCommand('git', ['init'], { cwd: sourceCwd })
             gitRoot = await runCommandCapture('git', ['rev-parse', '--show-toplevel'], { cwd: sourceCwd })
           }
-          const worktreeCwd = join(dirname(gitRoot), rawWorktreeName)
+          const baseCheckoutRoot = await resolvePrimaryCheckoutRoot(gitRoot)
+          const worktreeCwd = resolvePermanentWorktreeCwd(baseCheckoutRoot, rawWorktreeName)
           try {
             await stat(worktreeCwd)
             setJson(res, 409, { error: 'Worktree folder already exists' })
@@ -8619,6 +8698,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           }
 
           const branchName = await allocatePermanentWorktreeBranchName(gitRoot, rawWorktreeName)
+          await mkdir(dirname(worktreeCwd), { recursive: true })
+          await ensurePermanentWorktreeRootExcluded(baseCheckoutRoot)
           try {
             await runCommand('git', ['worktree', 'add', '-b', branchName, worktreeCwd, 'HEAD'], { cwd: gitRoot })
           } catch (error) {

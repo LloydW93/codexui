@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   buildProjectlessFolderName,
@@ -8,11 +9,14 @@ import {
   canonicalizeThreadListResponseForRead,
   canonicalizeWorkspaceRootsStateForRead,
   ensureDefaultFreeModeStateForMissingAuthSync,
+  ensurePermanentWorktreeRootExcluded,
   hasUsableCodexAuth,
   isEmptyThreadReadError,
   isThreadMaterializationPendingError,
   isThreadNotFoundError,
   isUnauthenticatedRateLimitError,
+  resolvePermanentWorktreeCwd,
+  resolvePrimaryCheckoutRootFromWorktreeList,
   writeFreeModeStateFile,
   writeWorkspaceRootsState,
 } from './codexAppServerBridge'
@@ -236,6 +240,64 @@ describe('writeWorkspaceRootsState', () => {
       })
     } finally {
       await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+})
+
+function runGit(cwd: string, args: string[]): string {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+  })
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${result.stderr || result.stdout}`)
+  }
+  return result.stdout.trim()
+}
+
+describe('permanent worktree path resolution', () => {
+  it('keeps named worktrees under the primary checkout when source cwd is a linked worktree', () => {
+    const primaryRoot = '/workspace/codexui'
+    const linkedRoot = '/workspace/codexui/.codex/worktrees/feature-a'
+    const raw = [
+      `worktree ${primaryRoot}`,
+      'HEAD 0000000000000000000000000000000000000000',
+      'branch refs/heads/main',
+      '',
+      `worktree ${linkedRoot}`,
+      'HEAD 1111111111111111111111111111111111111111',
+      'branch refs/heads/feature-a',
+      '',
+    ].join('\n')
+
+    const baseCheckoutRoot = resolvePrimaryCheckoutRootFromWorktreeList(raw, linkedRoot)
+
+    expect(baseCheckoutRoot).toBe(primaryRoot)
+    expect(resolvePermanentWorktreeCwd(baseCheckoutRoot, 'feature-b')).toBe('/workspace/codexui/.codex/worktrees/feature-b')
+  })
+
+  it('adds the hidden permanent worktree container to local git excludes', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'codexui-permanent-worktree-'))
+    const repoRoot = join(tempRoot, 'repo')
+
+    try {
+      await mkdir(repoRoot)
+      runGit(repoRoot, ['init'])
+      runGit(repoRoot, ['-c', 'user.name=Codex', '-c', 'user.email=codex@local', 'commit', '--allow-empty', '-m', 'init'])
+
+      await ensurePermanentWorktreeRootExcluded(repoRoot)
+      await ensurePermanentWorktreeRootExcluded(repoRoot)
+
+      const exclude = await readFile(join(repoRoot, '.git', 'info', 'exclude'), 'utf8')
+      expect(exclude.match(/^\/\.codex\/worktrees\/$/gm)).toHaveLength(1)
+
+      const worktreeCwd = resolvePermanentWorktreeCwd(repoRoot, 'manual-test')
+      await mkdir(join(repoRoot, '.codex', 'worktrees'), { recursive: true })
+      runGit(repoRoot, ['worktree', 'add', '-b', 'manual-test', worktreeCwd, 'HEAD'])
+      expect(runGit(worktreeCwd, ['branch', '--show-current'])).toBe('manual-test')
+      expect(runGit(repoRoot, ['status', '--porcelain', '--untracked-files=all'])).toBe('')
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true })
     }
   })
 })
