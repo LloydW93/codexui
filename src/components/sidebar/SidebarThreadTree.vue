@@ -334,6 +334,9 @@
                       <button class="project-menu-item" type="button" @click="onBrowseProjectFiles(group.projectName)">
                         Browse files
                       </button>
+                      <button class="project-menu-item" type="button" @click="onSaveProject(group.projectName)">
+                        Export Project
+                      </button>
                       <button class="project-menu-item" type="button" @click="openProjectAutomationDialog(group.projectName)">
                         {{ projectHasAutomation(group.projectName) ? 'Manage automations…' : 'Add automation…' }}
                       </button>
@@ -615,11 +618,20 @@
         <button class="thread-menu-item" type="button" @click="onBrowseThreadFiles(openThreadMenuThread.id)">
           Browse files
         </button>
+        <button class="thread-menu-item" type="button" @click="onSaveThreadProject(openThreadMenuThread.id)">
+          Export Project
+        </button>
         <button class="thread-menu-item" type="button" @click="onCopyThreadPath(openThreadMenuThread.id)">
           Copy path
         </button>
-        <button class="thread-menu-item" type="button" @click="onExportThread(openThreadMenuThread.id)">
-          Export chat
+        <button
+          class="thread-menu-item"
+          type="button"
+          :disabled="openThreadMenuThread.id !== selectedThreadId"
+          :title="openThreadMenuThread.id === selectedThreadId ? 'Copy chat' : 'Open this chat before copying'"
+          @click="onCopyThreadChat(openThreadMenuThread.id)"
+        >
+          Copy chat
         </button>
         <button class="thread-menu-item" type="button" @click="onForkThread(openThreadMenuThread.id)">
           Create chat fork
@@ -708,21 +720,14 @@
             </div>
 
             <div class="automation-target-dropdown">
-              <input
-                v-model="automationTargetSearch"
-                class="rename-thread-input"
-                type="search"
-                :placeholder="automationTargetMode === 'project' ? 'Search projects' : 'Search chats'"
+              <ComposerDropdown
+                v-model="automationTargetValue"
+                class="automation-thread-dropdown"
+                :options="automationTargetDropdownOptions"
+                :placeholder="automationTargetMode === 'project' ? 'Select project' : 'Select chat'"
+                enable-search
+                :search-placeholder="automationTargetMode === 'project' ? 'Search projects' : 'Search chats'"
               />
-              <select v-model="automationTargetValue" class="automation-thread-select" size="5">
-                <option
-                  v-for="option in filteredAutomationTargetOptions"
-                  :key="option.value"
-                  :value="option.value"
-                >
-                  {{ option.label }}
-                </option>
-              </select>
             </div>
           </div>
 
@@ -802,15 +807,13 @@
                 step="1"
                 @input="syncAutomationRruleFromScheduleDraft"
               />
-              <select
-                v-model="automationScheduleDraft.intervalUnit"
-                class="automation-schedule-unit"
-                @change="syncAutomationRruleFromScheduleDraft"
-              >
-                <option value="minutes">minutes</option>
-                <option value="hours">hours</option>
-                <option value="days">days</option>
-              </select>
+              <ComposerDropdown
+                class="automation-schedule-unit-dropdown"
+                :model-value="automationScheduleDraft.intervalUnit"
+                :options="automationIntervalUnitOptions"
+                placeholder="Unit"
+                @update:model-value="onAutomationIntervalUnitChange"
+              />
             </div>
 
             <input
@@ -824,13 +827,16 @@
             <p class="automation-schedule-preview">{{ automationSchedulePreview }}</p>
           </div>
 
-          <label class="automation-thread-field">
+          <div class="automation-thread-field">
             <span class="automation-thread-label">Status</span>
-            <select v-model="automationDraft.status" class="automation-thread-select">
-              <option value="ACTIVE">{{ t('Active') }}</option>
-              <option value="PAUSED">{{ t('Paused') }}</option>
-            </select>
-          </label>
+            <ComposerDropdown
+              class="automation-thread-dropdown"
+              :model-value="automationDraft.status"
+              :options="automationStatusOptions"
+              :placeholder="t('Status')"
+              @update:model-value="onAutomationStatusChange"
+            />
+          </div>
 
           <p v-if="automationDialogError" class="rename-thread-subtitle automation-thread-error">{{ automationDialogError }}</p>
           <p v-else-if="automationDialogNotice" class="rename-thread-subtitle automation-thread-notice">{{ automationDialogNotice }}</p>
@@ -895,6 +901,7 @@ import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import { useUiLanguage } from '../../composables/useUiLanguage'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { getPathLeafName, getPathParent, isAbsoluteLikePath, isProjectlessChatPath } from '../../pathUtils.js'
+import ComposerDropdown from '../content/ComposerDropdown.vue'
 import SidebarMenuRow from './SidebarMenuRow.vue'
 import { reconcilePinnedThreadIds } from './pinnedThreadUtils'
 
@@ -918,14 +925,16 @@ const emit = defineEmits<{
   archive: [threadId: string]
   'start-new-thread': [projectName: string]
   'browse-thread-files': [threadId: string]
+  'save-thread-project': [threadId: string]
   'browse-project-files': [projectName: string]
+  'save-project': [projectName: string]
   'request-project-git-status': [projectName: string]
   'create-project-worktree': [projectName: string]
   'rename-project': [payload: { projectName: string; displayName: string }]
   'rename-thread': [payload: { threadId: string; title: string }]
   'remove-project': [projectName: string]
   'reorder-project': [payload: { projectName: string; toIndex: number }]
-  'export-thread': [threadId: string]
+  'copy-thread-chat': [threadId: string]
   'fork-thread': [threadId: string]
   'start-new-chat': []
   'automations-changed': []
@@ -1015,7 +1024,6 @@ const automationDialogAutomationId = ref('')
 const automationDialogMode = ref<'create' | 'edit'>('create')
 const automationTargetPickerVisible = ref(false)
 const automationTargetMode = ref<AutomationTargetMode>('thread')
-const automationTargetSearch = ref('')
 const automationTargetValue = ref('')
 const automationDialogError = ref('')
 const automationDialogNotice = ref('')
@@ -1086,14 +1094,22 @@ const automationProjectTargetOptions = computed(() => {
   }
   return rows
 })
-const filteredAutomationTargetOptions = computed(() => {
-  const query = automationTargetSearch.value.trim().toLowerCase()
+const automationTargetDropdownOptions = computed(() => {
   const source = automationTargetMode.value === 'project'
     ? automationProjectTargetOptions.value
     : automationThreadTargetOptions.value
-  return query ? source.filter((option) => option.searchText.includes(query)) : source
+  return source.map((option) => ({ value: option.value, label: option.label }))
 })
-watch(filteredAutomationTargetOptions, (options) => {
+const automationIntervalUnitOptions = [
+  { value: 'minutes', label: 'minutes' },
+  { value: 'hours', label: 'hours' },
+  { value: 'days', label: 'days' },
+]
+const automationStatusOptions = computed(() => [
+  { value: 'ACTIVE', label: t('Active') },
+  { value: 'PAUSED', label: t('Paused') },
+])
+watch(automationTargetDropdownOptions, (options) => {
   if (!automationTargetPickerVisible.value) return
   if (options.some((option) => option.value === automationTargetValue.value)) return
   automationTargetValue.value = options[0]?.value ?? ''
@@ -1666,6 +1682,23 @@ function syncAutomationRruleFromScheduleDraft(): void {
   }
 }
 
+function onAutomationIntervalUnitChange(value: string): void {
+  if (value !== 'minutes' && value !== 'hours' && value !== 'days') return
+  automationScheduleDraft.value = {
+    ...automationScheduleDraft.value,
+    intervalUnit: value,
+  }
+  syncAutomationRruleFromScheduleDraft()
+}
+
+function onAutomationStatusChange(value: string): void {
+  if (value !== 'ACTIVE' && value !== 'PAUSED') return
+  automationDraft.value = {
+    ...automationDraft.value,
+    status: value,
+  }
+}
+
 function syncAutomationScheduleDraftFromRrule(): void {
   automationScheduleDraft.value = createScheduleDraftFromRrule(automationDraft.value.rrule)
 }
@@ -1678,8 +1711,9 @@ function setAutomationScheduleMode(mode: AutomationScheduleMode): void {
   syncAutomationRruleFromScheduleDraft()
 }
 
-function onExportThread(threadId: string): void {
-  emit('export-thread', threadId)
+function onCopyThreadChat(threadId: string): void {
+  if (threadId !== props.selectedThreadId) return
+  emit('copy-thread-chat', threadId)
   closeThreadMenu()
 }
 
@@ -1698,6 +1732,11 @@ function onStartNewThread(projectName: string): void {
 
 function onBrowseThreadFiles(threadId: string): void {
   emit('browse-thread-files', threadId)
+  closeThreadMenu()
+}
+
+function onSaveThreadProject(threadId: string): void {
+  emit('save-thread-project', threadId)
   closeThreadMenu()
 }
 
@@ -1899,7 +1938,6 @@ function openAutomationEditorFromPanel(payload: {
 function openAutomationCreatorFromPanel(): void {
   automationTargetPickerVisible.value = true
   automationTargetMode.value = 'thread'
-  automationTargetSearch.value = ''
   automationTargetValue.value = automationThreadTargetOptions.value[0]?.value ?? ''
   automationDialogScope.value = 'thread'
   automationDialogThreadId.value = ''
@@ -1914,14 +1952,9 @@ function openAutomationCreatorFromPanel(): void {
 
 function setAutomationTargetMode(mode: AutomationTargetMode): void {
   automationTargetMode.value = mode
-  automationTargetSearch.value = ''
   automationTargetValue.value = ''
   automationDialogScope.value = mode === 'project' ? 'project' : 'thread'
-  if (mode === 'thread') {
-    automationTargetValue.value = filteredAutomationTargetOptions.value[0]?.value ?? ''
-  } else if (mode === 'project') {
-    automationTargetValue.value = filteredAutomationTargetOptions.value[0]?.value ?? ''
-  }
+  automationTargetValue.value = automationTargetDropdownOptions.value[0]?.value ?? ''
 }
 
 function startNewAutomationDraft(): void {
@@ -2253,6 +2286,11 @@ function openRenameProjectMenu(group: UiProjectGroup): void {
 
 function onBrowseProjectFiles(projectName: string): void {
   emit('browse-project-files', projectName)
+  closeProjectMenu()
+}
+
+function onSaveProject(projectName: string): void {
+  emit('save-project', projectName)
   closeProjectMenu()
 }
 
@@ -3254,6 +3292,10 @@ onBeforeUnmount(() => {
   @apply rounded px-2 py-1 text-left text-sm text-zinc-700 hover:bg-zinc-100;
 }
 
+.thread-menu-item:disabled {
+  @apply cursor-not-allowed text-zinc-400 hover:bg-transparent;
+}
+
 .thread-menu-item-danger {
   @apply text-rose-700 hover:bg-rose-50;
 }
@@ -3371,7 +3413,21 @@ onBeforeUnmount(() => {
 }
 
 .automation-thread-panel {
-  @apply max-w-lg;
+  @apply max-w-lg overflow-y-auto;
+  max-height: min(90vh, calc(100dvh - 2rem));
+  overscroll-behavior: contain;
+}
+
+.automation-thread-panel .rename-thread-subtitle {
+  @apply flex-none overflow-visible;
+}
+
+.automation-thread-panel .rename-thread-actions {
+  @apply sticky bottom-0 -mx-4 -mb-4 border-t border-zinc-200 bg-white px-4 py-3;
+}
+
+:global(:root.dark) .automation-thread-panel .rename-thread-actions {
+  @apply border-zinc-700 bg-zinc-800;
 }
 
 .automation-thread-field {
@@ -3422,9 +3478,16 @@ onBeforeUnmount(() => {
   @apply text-xs font-medium uppercase tracking-wide text-zinc-500;
 }
 
-.automation-thread-textarea,
-.automation-thread-select {
+.automation-thread-textarea {
   @apply w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none focus:border-zinc-500;
+}
+
+.automation-thread-dropdown :deep(.composer-dropdown-trigger) {
+  @apply w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900;
+}
+
+.automation-thread-dropdown :deep(.composer-dropdown-value) {
+  @apply min-w-0 flex-1 text-left;
 }
 
 .automation-schedule-mode-group {
@@ -3453,6 +3516,10 @@ onBeforeUnmount(() => {
   @apply rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500;
 }
 
+.automation-schedule-unit-dropdown :deep(.composer-dropdown-trigger) {
+  @apply min-h-8 rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm text-zinc-900;
+}
+
 .automation-schedule-number {
   @apply w-20;
 }
@@ -3467,5 +3534,25 @@ onBeforeUnmount(() => {
 
 .automation-thread-notice {
   @apply mb-0 text-emerald-600;
+}
+
+@media (max-height: 640px) {
+  .automation-thread-panel {
+    @apply p-3;
+  }
+
+  .automation-thread-panel .rename-thread-actions {
+    @apply -mx-3 -mb-3 px-3 py-2;
+  }
+
+  .automation-thread-field,
+  .automation-target-picker,
+  .automation-thread-list {
+    @apply mb-2;
+  }
+
+  .automation-thread-textarea {
+    min-height: 7rem;
+  }
 }
 </style>
