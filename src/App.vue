@@ -2761,7 +2761,7 @@ function isWorktreePath(cwdRaw: string): boolean {
 function resolvePreferredLocalCwd(projectName: string, fallbackCwd = ''): string {
   const group = projectGroups.value.find((row) => row.projectName === projectName)
   if (!group) return resolveWorkspaceRootCwd(projectName) || fallbackCwd.trim()
-  const nonWorktreeThread = group.threads.find((thread) => !isWorktreePath(thread.cwd))
+  const nonWorktreeThread = group.threads.find((thread) => !thread.hasWorktree)
   const candidate = nonWorktreeThread?.cwd?.trim() ?? group.threads[0]?.cwd?.trim() ?? ''
   return candidate || resolveWorkspaceRootCwd(projectName) || fallbackCwd.trim()
 }
