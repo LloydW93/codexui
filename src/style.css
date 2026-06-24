@@ -239,6 +239,11 @@
   @apply hover:bg-zinc-800;
 }
 
+:root.dark .thread-show-more-button,
+:root.dark .thread-load-more-button {
+  @apply text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:text-zinc-600 disabled:hover:bg-transparent;
+}
+
 :root.dark .project-title {
   @apply text-zinc-300;
 }

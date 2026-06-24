@@ -85,6 +85,7 @@
             :project-cwd-by-name="projectCwdByName"
             v-if="!isSidebarCollapsed"
             :selected-thread-id="selectedThreadId" :is-loading="isLoadingThreads"
+            :is-loading-more-threads="isLoadingMoreThreads"
             :is-thread-list-fully-loaded="isThreadListFullyLoaded"
             :search-query="sidebarSearchQuery"
             :search-matched-thread-ids="serverMatchedThreadIds"
@@ -101,6 +102,7 @@
             @remove-project="onRemoveProject" @reorder-project="onReorderProject"
             @copy-thread-chat="onCopyThreadChat"
             @automations-changed="onAutomationsChanged"
+            @load-more-threads="loadMoreThreads"
             @start-new-chat="onStartProjectlessNewChat" />
         </div>
 
@@ -1428,6 +1430,7 @@ const {
   messages,
   hasMoreOlderMessages,
   isLoadingThreads,
+  isLoadingMoreThreads,
   isThreadListFullyLoaded,
   isLoadingMessages,
   isLoadingOlderMessages,
@@ -1438,6 +1441,7 @@ const {
   error: desktopError,
   refreshAll,
   refreshSkills,
+  loadMoreThreads,
   selectThread,
   ensureThreadMessagesLoaded,
   loadOlderMessages,

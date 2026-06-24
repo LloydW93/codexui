@@ -180,16 +180,21 @@ describe('getThreadDetail', () => {
     vi.unstubAllGlobals()
   })
 
-  it('reads modelProvider from nested thread payloads returned by thread/read', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const body = typeof init?.body === 'string'
-        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
-        : { method: '', params: {} }
-      expect(body.method).toBe('thread/read')
+  it('loads initial details from the newest thread turn page', async () => {
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      requests.push(String(input))
+      const url = new URL(String(input), 'http://localhost')
+      expect(url.pathname).toBe('/codex-api/thread-turn-page')
+      expect(url.searchParams.get('threadId')).toBe('legacy-thread')
+      expect(url.searchParams.get('beforeTurnId')).toBe(null)
+      expect(url.searchParams.get('limit')).toBe('10')
       return new Response(JSON.stringify({
+        startTurnIndex: 2,
+        hasMoreOlder: true,
         result: {
           thread: {
-            id: body.params.threadId,
+            id: 'legacy-thread',
             modelProvider: 'opencode_zen',
             turns: [],
           },
@@ -202,7 +207,9 @@ describe('getThreadDetail', () => {
 
     await expect(getThreadDetail('legacy-thread')).resolves.toMatchObject({
       modelProvider: 'opencode_zen',
+      hasMoreOlder: true,
     })
+    expect(requests).toEqual(['/codex-api/thread-turn-page?threadId=legacy-thread&limit=10'])
   })
 })
 

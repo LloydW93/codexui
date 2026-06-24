@@ -713,7 +713,8 @@ function normalizeSpeedMode(value: unknown): SpeedMode {
 }
 
 const INITIAL_THREAD_LIST_LIMIT = 50
-const BACKGROUND_THREAD_LIST_LIMIT = 100
+const OLDER_THREAD_LIST_LIMIT = 100
+const INITIAL_THREAD_TURN_PAGE_LIMIT = 10
 
 export type ThreadGroupsPage = {
   groups: UiProjectGroup[]
@@ -745,20 +746,53 @@ async function getThreadGroupsPageV2(cursor: string | null, limit: number): Prom
   }
 }
 
-async function getThreadMessagesV2(threadId: string): Promise<UiMessage[]> {
-  const payload = await callRpc<ThreadReadResponse>('thread/read', {
-    threadId,
-    includeTurns: true,
-  })
-  return normalizeThreadMessagesV2(payload, readThreadTurnStartIndex(payload))
-}
-
 async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
     includeTurns: false,
   })
   return normalizeThreadSummaryV2(payload)
+}
+
+async function getThreadTurnPageV2(threadId: string, beforeTurnId = '', limit = INITIAL_THREAD_TURN_PAGE_LIMIT): Promise<ThreadTurnPage & {
+  model: string
+  modelProvider: string
+}> {
+  const params = new URLSearchParams({
+    threadId,
+    limit: String(limit),
+  })
+  if (beforeTurnId.trim()) {
+    params.set('beforeTurnId', beforeTurnId.trim())
+  }
+  const response = await fetch(`/codex-api/thread-turn-page?${params.toString()}`)
+  if (!response.ok) {
+    throw new Error(`Thread page request failed with ${response.status}`)
+  }
+  const payload = await response.json() as {
+    result?: ThreadReadResponse
+    hasMoreOlder?: unknown
+    startTurnIndex?: unknown
+  }
+  if (!payload.result) {
+    throw new Error('Thread page response did not include a thread result')
+  }
+  const startTurnIndex = Math.max(0, Math.floor(typeof payload.startTurnIndex === 'number' ? payload.startTurnIndex : 0))
+
+  return {
+    model: normalizeThreadModelFromPayload(payload.result),
+    modelProvider: normalizeThreadModelProviderFromPayload(payload.result),
+    messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
+    inProgress: readThreadInProgressFromResponse(payload.result),
+    activeTurnId: readActiveTurnIdFromResponse(payload.result),
+    hasMoreOlder: payload.hasMoreOlder === true,
+    startTurnIndex,
+    turnIndexByTurnId: buildTurnIndexByTurnId(payload.result, startTurnIndex),
+  }
+}
+
+async function getThreadMessagesV2(threadId: string): Promise<UiMessage[]> {
+  return (await getThreadTurnPageV2(threadId)).messages
 }
 
 async function getThreadDetailV2(threadId: string): Promise<{
@@ -770,51 +804,11 @@ async function getThreadDetailV2(threadId: string): Promise<{
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
 }> {
-  const payload = await callRpc<ThreadReadResponse>('thread/read', {
-    threadId,
-    includeTurns: true,
-  })
-  const startTurnIndex = readThreadTurnStartIndex(payload)
-  const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
-  return {
-    model: normalizeThreadModelFromPayload(payload),
-    modelProvider: normalizeThreadModelProviderFromPayload(payload),
-    messages: normalized,
-    inProgress: readThreadInProgressFromResponse(payload),
-    activeTurnId: readActiveTurnIdFromResponse(payload),
-    hasMoreOlder: startTurnIndex > 0,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
-  }
+  return getThreadTurnPageV2(threadId)
 }
 
-async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, limit = 10): Promise<ThreadTurnPage> {
-  const params = new URLSearchParams({
-    threadId,
-    beforeTurnId,
-    limit: String(limit),
-  })
-  const response = await fetch(`/codex-api/thread-turn-page?${params.toString()}`)
-  if (!response.ok) {
-    throw new Error(`Older thread page request failed with ${response.status}`)
-  }
-  const payload = await response.json() as {
-    result?: ThreadReadResponse
-    hasMoreOlder?: unknown
-    startTurnIndex?: unknown
-  }
-  if (!payload.result) {
-    throw new Error('Older thread page response did not include a thread result')
-  }
-  const startTurnIndex = Math.max(0, Math.floor(typeof payload.startTurnIndex === 'number' ? payload.startTurnIndex : 0))
-
-  return {
-    messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
-    inProgress: readThreadInProgressFromResponse(payload.result),
-    activeTurnId: readActiveTurnIdFromResponse(payload.result),
-    hasMoreOlder: payload.hasMoreOlder === true,
-    startTurnIndex,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload.result, startTurnIndex),
-  }
+async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, limit = INITIAL_THREAD_TURN_PAGE_LIMIT): Promise<ThreadTurnPage> {
+  return getThreadTurnPageV2(threadId, beforeTurnId, limit)
 }
 
 export async function getThreadGroups(): Promise<UiProjectGroup[]> {
@@ -836,8 +830,8 @@ export async function getThreadGroupsPage(
   }
 }
 
-export function getBackgroundThreadListLimit(): number {
-  return BACKGROUND_THREAD_LIST_LIMIT
+export function getOlderThreadListLimit(): number {
+  return OLDER_THREAD_LIST_LIMIT
 }
 
 export async function getThreadMessages(threadId: string): Promise<UiMessage[]> {

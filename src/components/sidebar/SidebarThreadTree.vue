@@ -179,9 +179,10 @@
 
       <p v-else-if="isLoading && groups.length === 0" class="thread-tree-loading">{{ t('Loading threads...') }}</p>
 
-      <ul v-else-if="isChronologicalView" class="thread-list thread-list-global">
+      <template v-else-if="isChronologicalView">
+      <ul class="thread-list thread-list-global">
       <li
-        v-for="thread in globalThreads"
+        v-for="thread in visibleGlobalThreads"
         :key="thread.id"
         class="thread-row-item"
         :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
@@ -258,6 +259,16 @@
         </SidebarMenuRow>
       </li>
     </ul>
+
+    <SidebarMenuRow v-if="hasHiddenGlobalThreads" class="thread-show-more-row">
+      <template #left>
+        <span class="thread-show-more-spacer" />
+      </template>
+      <button class="thread-show-more-button" type="button" @click="toggleChronologicalListExpansion">
+        {{ chronologicalShowMoreLabel }}
+      </button>
+    </SidebarMenuRow>
+      </template>
 
     <div v-else ref="groupsContainerRef" class="thread-tree-groups" :style="groupsContainerStyle">
       <article
@@ -475,8 +486,8 @@
             <template #left>
               <span class="thread-show-more-spacer" />
             </template>
-            <button class="thread-show-more-button" type="button" @click="toggleProjectExpansion(group.projectName)">
-              {{ isExpanded(group.projectName) ? 'Show less' : 'Show more' }}
+            <button class="thread-show-more-button" type="button" @click="onProjectShowMoreClick(group.projectName)">
+              {{ projectShowMoreLabel(group) }}
             </button>
           </SidebarMenuRow>
       </article>
@@ -598,10 +609,24 @@
           <span class="thread-show-more-spacer" />
         </template>
         <button class="thread-show-more-button" type="button" @click="toggleChatsListExpansion">
-          {{ isChatsListExpanded ? 'Show less' : 'Show more' }}
+          {{ chatShowMoreLabel }}
         </button>
       </SidebarMenuRow>
     </section>
+
+    <SidebarMenuRow v-if="!isThreadListFullyLoaded" class="thread-load-more-row">
+      <template #left>
+        <span class="thread-show-more-spacer" />
+      </template>
+      <button
+        class="thread-load-more-button"
+        type="button"
+        :disabled="isLoadingMoreThreads"
+        @click="$emit('load-more-threads')"
+      >
+        {{ isLoadingMoreThreads ? t('Loading...') : t('Load older threads') }}
+      </button>
+    </SidebarMenuRow>
 
     <Teleport to="body">
       <div
@@ -912,6 +937,7 @@ const props = defineProps<{
   projectCwdByName: Record<string, string>
   selectedThreadId: string
   isLoading: boolean
+  isLoadingMoreThreads: boolean
   isThreadListFullyLoaded: boolean
   searchQuery: string
   searchMatchedThreadIds: string[] | null
@@ -938,6 +964,7 @@ const emit = defineEmits<{
   'fork-thread': [threadId: string]
   'start-new-chat': []
   'automations-changed': []
+  'load-more-threads': []
 }>()
 
 type PendingProjectDrag = {
@@ -984,6 +1011,11 @@ type AutomationScheduleDraft = {
 
 const DRAG_START_THRESHOLD_PX = 4
 const PROJECT_GROUP_EXPANDED_GAP_PX = 6
+const COLLAPSED_PROJECT_THREAD_LIMIT = 10
+const PROJECT_THREAD_RENDER_STEP = 50
+const CHRONOLOGICAL_THREAD_RENDER_STEP = 100
+const CHAT_THREAD_RENDER_STEP = 50
+const SEARCH_THREAD_RENDER_STEP = 100
 const SECTION_EXPANSION_STORAGE_KEY = 'codex-web-local.sidebar-section-expansion.v1'
 const CHATS_FIRST_STORAGE_KEY = 'codex-web-local.sidebar-chats-first.v1'
 const CHAT_SORT_MODE_STORAGE_KEY = 'codex-web-local.sidebar-chat-sort-mode.v1'
@@ -993,6 +1025,9 @@ const isPinnedSectionExpanded = ref(true)
 const isProjectsSectionExpanded = ref(true)
 const isChatsSectionExpanded = ref(true)
 const isChatsListExpanded = ref(false)
+const projectThreadVisibleLimitByName = ref<Record<string, number>>({})
+const chronologicalThreadVisibleLimit = ref(CHRONOLOGICAL_THREAD_RENDER_STEP)
+const chatThreadVisibleLimit = ref(CHAT_THREAD_RENDER_STEP)
 const showChatsFirst = ref(loadBooleanStorage(CHATS_FIRST_STORAGE_KEY, false))
 const chatSortMode = ref<ChatSortMode>(loadChatSortMode())
 let hasLoadedPinnedThreadState = false
@@ -1284,6 +1319,22 @@ const globalThreads = computed<UiThread[]>(() => {
   })
 })
 
+const visibleGlobalThreads = computed(() => {
+  return globalThreads.value.slice(0, chronologicalThreadVisibleLimit.value)
+})
+
+const hasHiddenGlobalThreads = computed(() => {
+  return globalThreads.value.length > visibleGlobalThreads.value.length ||
+    (chronologicalThreadVisibleLimit.value > CHRONOLOGICAL_THREAD_RENDER_STEP && globalThreads.value.length > CHRONOLOGICAL_THREAD_RENDER_STEP)
+})
+
+const chronologicalShowMoreLabel = computed(() => (
+  chronologicalThreadVisibleLimit.value >= globalThreads.value.length &&
+    globalThreads.value.length > CHRONOLOGICAL_THREAD_RENDER_STEP
+    ? t('Show less')
+    : t('Show more')
+))
+
 const chatThreads = computed(() => {
   const rows = globalThreads.value.filter((thread) => isProjectlessChatPath(thread.cwd))
   const timestampKey = chatSortMode.value === 'created' ? 'createdAtIso' : 'updatedAtIso'
@@ -1296,13 +1347,31 @@ const chatThreads = computed(() => {
 })
 
 const visibleChatThreads = computed(() => {
-  if (isSearchActive.value) return chatThreads.value
-  return isChatsListExpanded.value ? chatThreads.value : chatThreads.value.slice(0, 10)
+  if (isSearchActive.value) {
+    return chatThreads.value.slice(0, Math.max(chatThreadVisibleLimit.value, SEARCH_THREAD_RENDER_STEP))
+  }
+  if (!isChatsListExpanded.value) return chatThreads.value.slice(0, COLLAPSED_PROJECT_THREAD_LIMIT)
+  return chatThreads.value.slice(0, chatThreadVisibleLimit.value)
 })
 
 const hasHiddenChatThreads = computed(() => {
-  if (isSearchActive.value) return false
-  return chatThreads.value.length > 10
+  if (isSearchActive.value) return chatThreads.value.length > visibleChatThreads.value.length
+  return chatThreads.value.length > visibleChatThreads.value.length ||
+    (isChatsListExpanded.value && chatThreads.value.length > COLLAPSED_PROJECT_THREAD_LIMIT)
+})
+
+const chatShowMoreLabel = computed(() => (
+  !isSearchActive.value && isChatsListExpanded.value && visibleChatThreads.value.length >= chatThreads.value.length
+    ? t('Show less')
+    : t('Show more')
+))
+
+watch(normalizedSearchQuery, () => {
+  resetThreadRowWindows()
+})
+
+watch(threadViewMode, () => {
+  resetThreadRowWindows()
 })
 
 const threadById = computed(() => {
@@ -2364,15 +2433,93 @@ function isCollapsed(projectName: string): boolean {
   return collapsedProjects.value[projectName] === true
 }
 
-function toggleProjectExpansion(projectName: string): void {
+function resetThreadRowWindows(): void {
+  projectThreadVisibleLimitByName.value = {}
+  chronologicalThreadVisibleLimit.value = isSearchActive.value
+    ? SEARCH_THREAD_RENDER_STEP
+    : CHRONOLOGICAL_THREAD_RENDER_STEP
+  chatThreadVisibleLimit.value = isSearchActive.value
+    ? SEARCH_THREAD_RENDER_STEP
+    : CHAT_THREAD_RENDER_STEP
+}
+
+function omitProjectLimit(projectName: string): Record<string, number> {
+  const next = { ...projectThreadVisibleLimitByName.value }
+  delete next[projectName]
+  return next
+}
+
+function onProjectShowMoreClick(projectName: string): void {
+  const rows = projectThreadsByName(projectName)
+  const currentLimit = projectThreadVisibleLimit(projectName)
+
+  if (isSearchActive.value) {
+    projectThreadVisibleLimitByName.value = {
+      ...projectThreadVisibleLimitByName.value,
+      [projectName]: Math.min(rows.length, currentLimit + SEARCH_THREAD_RENDER_STEP),
+    }
+    return
+  }
+
+  if (!isExpanded(projectName)) {
+    expandedProjects.value = {
+      ...expandedProjects.value,
+      [projectName]: true,
+    }
+    projectThreadVisibleLimitByName.value = {
+      ...projectThreadVisibleLimitByName.value,
+      [projectName]: Math.min(rows.length, PROJECT_THREAD_RENDER_STEP),
+    }
+    return
+  }
+
+  if (currentLimit < rows.length) {
+    projectThreadVisibleLimitByName.value = {
+      ...projectThreadVisibleLimitByName.value,
+      [projectName]: Math.min(rows.length, currentLimit + PROJECT_THREAD_RENDER_STEP),
+    }
+    return
+  }
+
   expandedProjects.value = {
     ...expandedProjects.value,
-    [projectName]: !isExpanded(projectName),
+    [projectName]: false,
   }
+  projectThreadVisibleLimitByName.value = omitProjectLimit(projectName)
 }
 
 function toggleChatsListExpansion(): void {
-  isChatsListExpanded.value = !isChatsListExpanded.value
+  if (isSearchActive.value) {
+    chatThreadVisibleLimit.value += SEARCH_THREAD_RENDER_STEP
+    return
+  }
+
+  if (!isChatsListExpanded.value) {
+    isChatsListExpanded.value = true
+    chatThreadVisibleLimit.value = CHAT_THREAD_RENDER_STEP
+    return
+  }
+
+  if (chatThreadVisibleLimit.value < chatThreads.value.length) {
+    chatThreadVisibleLimit.value += CHAT_THREAD_RENDER_STEP
+    return
+  }
+
+  isChatsListExpanded.value = false
+  chatThreadVisibleLimit.value = CHAT_THREAD_RENDER_STEP
+}
+
+function toggleChronologicalListExpansion(): void {
+  if (chronologicalThreadVisibleLimit.value < globalThreads.value.length) {
+    chronologicalThreadVisibleLimit.value += isSearchActive.value
+      ? SEARCH_THREAD_RENDER_STEP
+      : CHRONOLOGICAL_THREAD_RENDER_STEP
+    return
+  }
+
+  chronologicalThreadVisibleLimit.value = isSearchActive.value
+    ? SEARCH_THREAD_RENDER_STEP
+    : CHRONOLOGICAL_THREAD_RENDER_STEP
 }
 
 function toggleProjectCollapse(projectName: string): void {
@@ -2892,17 +3039,39 @@ function projectThreads(group: UiProjectGroup): UiThread[] {
   return unpinnedThreadsByProjectName.value.get(group.projectName) ?? []
 }
 
+function projectThreadsByName(projectName: string): UiThread[] {
+  return unpinnedThreadsByProjectName.value.get(projectName) ?? []
+}
+
+function projectThreadVisibleLimit(projectName: string): number {
+  if (isSearchActive.value) {
+    return projectThreadVisibleLimitByName.value[projectName] ?? SEARCH_THREAD_RENDER_STEP
+  }
+  if (!isExpanded(projectName)) return COLLAPSED_PROJECT_THREAD_LIMIT
+  return projectThreadVisibleLimitByName.value[projectName] ?? PROJECT_THREAD_RENDER_STEP
+}
+
 function visibleThreads(group: UiProjectGroup): UiThread[] {
-  if (isSearchActive.value) return projectThreads(group)
   if (isCollapsed(group.projectName)) return []
 
   const rows = projectThreads(group)
-  return isExpanded(group.projectName) ? rows : rows.slice(0, 10)
+  return rows.slice(0, projectThreadVisibleLimit(group.projectName))
 }
 
 function hasHiddenThreads(group: UiProjectGroup): boolean {
-  if (isSearchActive.value) return false
-  return !isCollapsed(group.projectName) && projectThreads(group).length > 10
+  if (isCollapsed(group.projectName)) return false
+  const rows = projectThreads(group)
+  const visibleCount = visibleThreads(group).length
+  if (rows.length > visibleCount) return true
+  return !isSearchActive.value && isExpanded(group.projectName) && rows.length > COLLAPSED_PROJECT_THREAD_LIMIT
+}
+
+function projectShowMoreLabel(group: UiProjectGroup): string {
+  const rows = projectThreads(group)
+  if (!isSearchActive.value && isExpanded(group.projectName) && visibleThreads(group).length >= rows.length) {
+    return t('Show less')
+  }
+  return t('Show more')
 }
 
 function hasThreads(group: UiProjectGroup): boolean {
@@ -3314,6 +3483,14 @@ onBeforeUnmount(() => {
 
 .thread-show-more-button {
   @apply block mx-auto rounded-lg px-2 py-0.5 text-sm font-normal text-zinc-600 transition hover:text-zinc-800 hover:bg-zinc-200;
+}
+
+.thread-load-more-row {
+  @apply mt-1;
+}
+
+.thread-load-more-button {
+  @apply block mx-auto rounded-lg px-2 py-0.5 text-sm font-normal text-zinc-600 transition hover:text-zinc-800 hover:bg-zinc-200 disabled:cursor-not-allowed disabled:text-zinc-400 disabled:hover:bg-transparent;
 }
 
 .thread-row-automation-chip {

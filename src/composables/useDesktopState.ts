@@ -12,7 +12,7 @@ import {
   getSkillsList,
   getThreadDetail,
   getOlderThreadMessages,
-  getBackgroundThreadListLimit,
+  getOlderThreadListLimit,
   interruptThreadTurn,
   pickCodexRateLimitSnapshot,
   replyToServerRequest,
@@ -85,7 +85,6 @@ const LEGACY_COLLABORATION_MODE_STORAGE_KEY = 'codex-web-local.collaboration-mod
 const NEW_THREAD_COLLABORATION_MODE_CONTEXT = '__new-thread__'
 const NEW_THREAD_PROVIDER_MODEL_CONTEXT_PREFIX = '__new-thread-provider__::'
 const EVENT_SYNC_DEBOUNCE_MS = 220
-const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 10_000
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
@@ -1575,6 +1574,7 @@ export function useDesktopState() {
   const accountRateLimitSnapshots = ref<UiRateLimitSnapshot[]>([])
 
   const isLoadingThreads = ref(false)
+  const isLoadingMoreThreads = ref(false)
   const isLoadingMessages = ref(false)
   const isThreadListFullyLoaded = ref(false)
   const isSendingMessage = ref(false)
@@ -1633,7 +1633,6 @@ export function useDesktopState() {
   const lastMessageLoadAtByThreadId = new Map<string, number>()
   const lastMessageLoadFailureAtByThreadId = new Map<string, number>()
   let threadListNextCursor: string | null = null
-  let threadListBackgroundTimer: number | null = null
   let isLoadingRemainingThreadPages = false
   let hasLoadedAllThreadPages = false
   let loadedThreadListGroups: UiProjectGroup[] = []
@@ -2491,9 +2490,6 @@ export function useDesktopState() {
       clearInterruptPersistenceGate(threadId)
     }
     applyThreadFlags()
-    if (!nextInProgress && !hasActiveInProgressThreads() && threadListNextCursor) {
-      scheduleRemainingThreadPages()
-    }
   }
 
   function clearInterruptPersistenceGate(threadId: string): void {
@@ -4400,49 +4396,23 @@ export function useDesktopState() {
       })
   }
 
-  function hasActiveInProgressThreads(): boolean {
-    return Object.values(inProgressById.value).some((value) => value === true)
-  }
-
-  function scheduleRemainingThreadPages(rootsState: WorkspaceRootsState | null = loadedThreadListRootsState): void {
-    if (!threadListNextCursor || isLoadingRemainingThreadPages || hasActiveInProgressThreads()) return
-
-    loadedThreadListRootsState = rootsState
-
-    if (typeof window === 'undefined') {
-      void loadRemainingThreadPages(rootsState)
-      return
-    }
-
-    if (threadListBackgroundTimer !== null) {
-      window.clearTimeout(threadListBackgroundTimer)
-    }
-
-    threadListBackgroundTimer = window.setTimeout(() => {
-      threadListBackgroundTimer = null
-      if (!threadListNextCursor || hasActiveInProgressThreads()) return
-      void loadRemainingThreadPages(loadedThreadListRootsState)
-    }, BACKGROUND_THREAD_PAGINATION_DELAY_MS)
-  }
-
-  async function loadRemainingThreadPages(rootsState: WorkspaceRootsState | null): Promise<void> {
-    if (isLoadingRemainingThreadPages || !threadListNextCursor || hasActiveInProgressThreads()) return
+  async function loadMoreThreads(): Promise<void> {
+    if (isLoadingRemainingThreadPages || !threadListNextCursor) return
     isLoadingRemainingThreadPages = true
+    isLoadingMoreThreads.value = true
 
     try {
-      const page = await getThreadGroupsPage(threadListNextCursor, getBackgroundThreadListLimit())
+      const page = await getThreadGroupsPage(threadListNextCursor, getOlderThreadListLimit())
       threadListNextCursor = page.nextCursor
       hasLoadedAllThreadPages = page.nextCursor === null
       isThreadListFullyLoaded.value = hasLoadedAllThreadPages
       loadedThreadListGroups = mergeThreadGroupPages(loadedThreadListGroups, page.groups)
-      applyThreadGroups(loadedThreadListGroups, rootsState)
+      applyThreadGroups(loadedThreadListGroups, loadedThreadListRootsState)
     } catch {
-      // Keep the first page usable; a later refresh can retry remaining pages.
+      // Keep the current thread list usable; a later explicit load can retry.
     } finally {
       isLoadingRemainingThreadPages = false
-      if (threadListNextCursor && !hasActiveInProgressThreads()) {
-        scheduleRemainingThreadPages(rootsState)
-      }
+      isLoadingMoreThreads.value = false
     }
   }
 
@@ -4485,9 +4455,6 @@ export function useDesktopState() {
       applyThreadGroups(loadedThreadListGroups, rootsState)
       hasLoadedThreads.value = true
       lastThreadListLoadAt = Date.now()
-      if (!hasLoadedAllThreadPages) {
-        scheduleRemainingThreadPages(rootsState)
-      }
 
       const flatThreads = flattenThreads(projectGroups.value)
       pruneThreadScopedState(flatThreads)
@@ -5725,10 +5692,6 @@ export function useDesktopState() {
       window.clearTimeout(rateLimitRefreshTimer)
       rateLimitRefreshTimer = null
     }
-    if (threadListBackgroundTimer !== null && typeof window !== 'undefined') {
-      window.clearTimeout(threadListBackgroundTimer)
-      threadListBackgroundTimer = null
-    }
     if (typeof window !== 'undefined') {
       for (const timerId of delayedTurnSyncTimerByThreadId.values()) {
         window.clearTimeout(timerId)
@@ -5836,6 +5799,7 @@ export function useDesktopState() {
     messages,
     hasMoreOlderMessages,
     isLoadingThreads,
+    isLoadingMoreThreads,
     isThreadListFullyLoaded,
     isLoadingMessages,
     isLoadingOlderMessages,
@@ -5847,6 +5811,7 @@ export function useDesktopState() {
     error,
     refreshAll,
     refreshSkills,
+    loadMoreThreads,
     selectThread,
     loadMessages,
     loadOlderMessages,

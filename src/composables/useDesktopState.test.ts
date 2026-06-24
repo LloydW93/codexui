@@ -43,7 +43,7 @@ const gatewayMocks = vi.hoisted(() => ({
 
 vi.mock('../api/codexGateway', () => ({
   ...gatewayMocks,
-  getBackgroundThreadListLimit: vi.fn(() => 100),
+  getOlderThreadListLimit: vi.fn(() => 100),
   pickCodexRateLimitSnapshot: vi.fn(() => null),
 }))
 
@@ -604,6 +604,35 @@ describe('startup request deduplication', () => {
     } finally {
       nowSpy.mockRestore()
     }
+  })
+
+  it('loads only the first thread-list page until explicitly asked for more', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+        nextCursor: 'cursor-2',
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('thread-2', '/tmp/project')] }],
+        nextCursor: null,
+      })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(1)
+    expect(state.isThreadListFullyLoaded.value).toBe(false)
+    expect(state.projectGroups.value.flatMap((group) => group.threads.map((row) => row.id))).toEqual(['thread-1'])
+
+    await state.loadMoreThreads()
+
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenLastCalledWith('cursor-2', 100)
+    expect(state.isThreadListFullyLoaded.value).toBe(true)
+    expect(state.projectGroups.value.flatMap((group) => group.threads.map((row) => row.id)).sort()).toEqual(['thread-1', 'thread-2'])
   })
 
   it('reuses a just-loaded skills list for the same selected cwd', async () => {
