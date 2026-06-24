@@ -719,6 +719,44 @@ describe('startup request deduplication', () => {
 })
 
 describe('live error overlay', () => {
+  it('drops old loaded message payloads outside the recent thread retention window', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue(null)
+    gatewayMocks.getThreadDetail.mockImplementation(async (threadId: string) => ({
+      messages: [
+        {
+          id: `${threadId}-message`,
+          role: 'user',
+          text: `message for ${threadId}`,
+          messageType: 'userMessage',
+        },
+      ],
+      inProgress: false,
+      activeTurnId: '',
+      turnIndexByTurnId: {},
+      hasMoreOlder: false,
+    }))
+
+    const state = useDesktopState()
+
+    for (let index = 1; index <= 7; index += 1) {
+      await state.loadMessages(`thread-${index}`)
+    }
+    await state.loadMessages('thread-1')
+
+    expect(gatewayMocks.getThreadDetail.mock.calls.map((call) => call[0])).toEqual([
+      'thread-1',
+      'thread-2',
+      'thread-3',
+      'thread-4',
+      'thread-5',
+      'thread-6',
+      'thread-7',
+      'thread-1',
+    ])
+  })
+
   it('shows the default thinking overlay while a selected thread is in progress without activity events', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])

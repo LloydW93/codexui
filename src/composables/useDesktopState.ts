@@ -91,6 +91,7 @@ const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
+const RETAINED_MESSAGE_THREAD_LIMIT = 5
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
@@ -1638,6 +1639,7 @@ export function useDesktopState() {
   let loadedThreadListGroups: UiProjectGroup[] = []
   let loadedThreadListRootsState: WorkspaceRootsState | null = null
   let hasHydratedWorkspaceRootsState = false
+  let retainedMessageThreadIds: string[] = []
   let activeReasoningItemId = ''
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
@@ -1792,6 +1794,58 @@ export function useDesktopState() {
     )
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
+    rememberRetainedMessageThread(nextThreadId)
+    pruneRetainedMessagePayloads()
+  }
+
+  function rememberRetainedMessageThread(threadId: string): void {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+    retainedMessageThreadIds = [
+      ...retainedMessageThreadIds.filter((existingThreadId) => existingThreadId !== normalizedThreadId),
+      normalizedThreadId,
+    ].slice(-RETAINED_MESSAGE_THREAD_LIMIT)
+  }
+
+  function collectRetainedMessageThreadIds(): Set<string> {
+    const retainedThreadIds = new Set(retainedMessageThreadIds)
+    const selected = selectedThreadId.value.trim()
+    if (selected) retainedThreadIds.add(selected)
+
+    for (const [threadId, isInProgress] of Object.entries(inProgressById.value)) {
+      if (isInProgress) retainedThreadIds.add(threadId)
+    }
+    for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
+      if (threadId !== GLOBAL_SERVER_REQUEST_SCOPE && requests.length > 0) retainedThreadIds.add(threadId)
+    }
+    for (const [threadId, queued] of Object.entries(queuedMessagesByThreadId.value)) {
+      if (queued.length > 0) retainedThreadIds.add(threadId)
+    }
+    for (const [threadId, isProcessing] of Object.entries(queueProcessingByThreadId.value)) {
+      if (isProcessing) retainedThreadIds.add(threadId)
+    }
+    for (const threadId of Object.keys(pendingTurnRequestByThreadId.value)) {
+      retainedThreadIds.add(threadId)
+    }
+    return retainedThreadIds
+  }
+
+  function pruneRetainedMessagePayloads(): void {
+    const retainedThreadIds = collectRetainedMessageThreadIds()
+    loadedMessagesByThreadId.value = pruneThreadStateMap(loadedMessagesByThreadId.value, retainedThreadIds)
+    loadedVersionByThreadId.value = pruneThreadStateMap(loadedVersionByThreadId.value, retainedThreadIds)
+    hasMoreOlderMessagesByThreadId.value = pruneThreadStateMap(hasMoreOlderMessagesByThreadId.value, retainedThreadIds)
+    loadingOlderMessagesByThreadId.value = pruneThreadStateMap(loadingOlderMessagesByThreadId.value, retainedThreadIds)
+    turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, retainedThreadIds)
+    persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, retainedThreadIds)
+    livePlanMessagesByThreadId.value = pruneThreadStateMap(livePlanMessagesByThreadId.value, retainedThreadIds)
+    liveAgentMessagesByThreadId.value = pruneThreadStateMap(liveAgentMessagesByThreadId.value, retainedThreadIds)
+    liveReasoningTextByThreadId.value = pruneThreadStateMap(liveReasoningTextByThreadId.value, retainedThreadIds)
+    liveCommandsByThreadId.value = pruneThreadStateMap(liveCommandsByThreadId.value, retainedThreadIds)
+    liveFileChangeMessagesByThreadId.value = pruneThreadStateMap(liveFileChangeMessagesByThreadId.value, retainedThreadIds)
+    turnSummaryByThreadId.value = pruneThreadStateMap(turnSummaryByThreadId.value, retainedThreadIds)
+    turnActivityByThreadId.value = pruneThreadStateMap(turnActivityByThreadId.value, retainedThreadIds)
+    activeTurnIdByThreadId.value = pruneThreadStateMap(activeTurnIdByThreadId.value, retainedThreadIds)
   }
 
   function setSelectedModelIdForThread(threadId: string, modelId: string): void {
@@ -2625,12 +2679,14 @@ export function useDesktopState() {
   }
 
   function setPersistedMessagesForThread(threadId: string, nextMessages: UiMessage[]): void {
+    rememberRetainedMessageThread(threadId)
     const previous = persistedMessagesByThreadId.value[threadId] ?? []
     if (areMessageArraysEqual(previous, nextMessages)) return
     persistedMessagesByThreadId.value = {
       ...persistedMessagesByThreadId.value,
       [threadId]: nextMessages,
     }
+    pruneRetainedMessagePayloads()
   }
 
   function appendOptimisticUserMessage(
@@ -4455,6 +4511,8 @@ export function useDesktopState() {
     if (!threadId) {
       return
     }
+    rememberRetainedMessageThread(threadId)
+    pruneRetainedMessagePayloads()
     const recentLoadFailure =
       Date.now() - (lastMessageLoadFailureAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
     if (turnErrorByThreadId.value[threadId]?.transient && (options.silent === true || recentLoadFailure)) {
@@ -4584,6 +4642,7 @@ export function useDesktopState() {
 
   async function loadOlderMessages(threadId: string = selectedThreadId.value): Promise<void> {
     if (!threadId) return
+    rememberRetainedMessageThread(threadId)
     if (loadingOlderMessagesByThreadId.value[threadId] === true) return
     if (hasMoreOlderMessagesByThreadId.value[threadId] !== true) return
 
@@ -5676,6 +5735,7 @@ export function useDesktopState() {
       }
     }
     delayedTurnSyncTimerByThreadId.clear()
+    retainedMessageThreadIds = []
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
     persistedMessagesByThreadId.value = {}
