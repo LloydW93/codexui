@@ -229,6 +229,12 @@ const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
 const THREAD_RESPONSE_TURN_LIMIT = 10
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
+const THREAD_TURN_PAGE_READ_CACHE_LIMIT = 6
+const THREAD_READ_SNAPSHOT_CACHE_LIMIT = 4
+const THREAD_LIVE_STATE_CACHE_LIMIT = 4
+const STREAM_EVENT_THREAD_BUFFER_LIMIT = 32
+const CAPTURED_ITEM_THREAD_LIMIT = 32
+const CAPTURED_ITEM_PER_THREAD_LIMIT = 200
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
@@ -242,6 +248,32 @@ const DEFAULT_API_PERF_MS_THRESHOLD = 300
 const DEFAULT_API_PERF_BODY_MB_THRESHOLD = 1
 const MB_DIVISOR = 1024 * 1024
 const COMPOSIO_USER_DATA_PATH = join(homedir(), '.composio', 'user_data.json')
+
+export function setBoundedMapEntry<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
+  if (limit <= 0) {
+    map.clear()
+    return
+  }
+  if (map.has(key)) map.delete(key)
+  map.set(key, value)
+  while (map.size > limit) {
+    const oldestKey = map.keys().next().value as K | undefined
+    if (oldestKey === undefined) break
+    map.delete(oldestKey)
+  }
+}
+
+function getAndTouchMapEntry<K, V>(map: Map<K, V>, key: K): V | undefined {
+  const value = map.get(key)
+  if (value === undefined || !map.has(key)) return value
+  map.delete(key)
+  map.set(key, value)
+  return value
+}
+
+function touchMapEntry<K, V>(map: Map<K, V>, key: K): V | undefined {
+  return getAndTouchMapEntry(map, key)
+}
 
 type SessionRecoveredFileChange = {
   path: string
@@ -6480,6 +6512,7 @@ class AppServerProcess {
 
       this.pending.clear()
       this.pendingServerRequests.clear()
+      this.clearCachedThreadState()
       this.process = null
       this.initialized = false
       this.initializePromise = null
@@ -6576,7 +6609,9 @@ class AppServerProcess {
     let buffer = this.streamEventsByThreadId.get(threadId)
     if (!buffer) {
       buffer = []
-      this.streamEventsByThreadId.set(threadId, buffer)
+      setBoundedMapEntry(this.streamEventsByThreadId, threadId, buffer, STREAM_EVENT_THREAD_BUFFER_LIMIT)
+    } else {
+      touchMapEntry(this.streamEventsByThreadId, threadId)
     }
     buffer.push(frame)
     if (buffer.length > STREAM_EVENT_BUFFER_LIMIT) {
@@ -6585,23 +6620,23 @@ class AppServerProcess {
   }
 
   getStreamEvents(threadId: string, limit: number): StreamEventFrame[] {
-    const buffer = this.streamEventsByThreadId.get(threadId)
+    const buffer = getAndTouchMapEntry(this.streamEventsByThreadId, threadId)
     if (!buffer || buffer.length === 0) return []
     return buffer.slice(-limit)
   }
 
   storeThreadReadSnapshot(threadId: string, snapshot: unknown): void {
-    this.lastThreadReadSnapshotByThreadId.set(threadId, snapshot)
+    setBoundedMapEntry(this.lastThreadReadSnapshotByThreadId, threadId, snapshot, THREAD_READ_SNAPSHOT_CACHE_LIMIT)
     this.threadTurnPageReadCacheByThreadId.delete(threadId)
   }
 
   getLastThreadReadSnapshot(threadId: string): unknown | null {
-    return this.lastThreadReadSnapshotByThreadId.get(threadId) ?? null
+    return getAndTouchMapEntry(this.lastThreadReadSnapshotByThreadId, threadId) ?? null
   }
 
   async readThreadForTurnPage(threadId: string): Promise<unknown> {
     const now = Date.now()
-    const cached = this.threadTurnPageReadCacheByThreadId.get(threadId)
+    const cached = getAndTouchMapEntry(this.threadTurnPageReadCacheByThreadId, threadId)
     if (cached && cached.expiresAt > now) return cached.result
     if (cached) this.threadTurnPageReadCacheByThreadId.delete(threadId)
 
@@ -6612,10 +6647,15 @@ class AppServerProcess {
       threadId,
       includeTurns: true,
     }).then((result) => {
-      this.threadTurnPageReadCacheByThreadId.set(threadId, {
-        result,
-        expiresAt: Date.now() + THREAD_TURN_PAGE_READ_CACHE_TTL_MS,
-      })
+      setBoundedMapEntry(
+        this.threadTurnPageReadCacheByThreadId,
+        threadId,
+        {
+          result,
+          expiresAt: Date.now() + THREAD_TURN_PAGE_READ_CACHE_TTL_MS,
+        },
+        THREAD_TURN_PAGE_READ_CACHE_LIMIT,
+      )
       return result
     }).finally(() => {
       this.threadTurnPageReadPromiseByThreadId.delete(threadId)
@@ -6626,13 +6666,16 @@ class AppServerProcess {
   }
 
   cacheLiveState(threadId: string, data: unknown, turnCount: number, sessionSize: number): void {
-    this.liveStateCache.set(threadId, { data, turnCount, sessionSize })
+    setBoundedMapEntry(this.liveStateCache, threadId, { data, turnCount, sessionSize }, THREAD_LIVE_STATE_CACHE_LIMIT)
   }
 
   getCachedLiveState(threadId: string, turnCount: number, sessionSize: number): unknown | null {
-    const cached = this.liveStateCache.get(threadId)
+    const cached = getAndTouchMapEntry(this.liveStateCache, threadId)
     if (!cached) return null
-    if (cached.turnCount !== turnCount || cached.sessionSize !== sessionSize) return null
+    if (cached.turnCount !== turnCount || cached.sessionSize !== sessionSize) {
+      this.liveStateCache.delete(threadId)
+      return null
+    }
     return cached.data
   }
 
@@ -6664,7 +6707,9 @@ class AppServerProcess {
     let threadItems = this.capturedItemsByThreadId.get(threadId)
     if (!threadItems) {
       threadItems = new Map()
-      this.capturedItemsByThreadId.set(threadId, threadItems)
+      setBoundedMapEntry(this.capturedItemsByThreadId, threadId, threadItems, CAPTURED_ITEM_THREAD_LIMIT)
+    } else {
+      touchMapEntry(this.capturedItemsByThreadId, threadId)
     }
 
     const isCompleted = notification.method === 'item/completed'
@@ -6672,17 +6717,22 @@ class AppServerProcess {
 
     if (existing && existing.completed && !isCompleted) return
 
-    threadItems.set(itemId, {
-      id: itemId,
-      type: itemType,
-      turnId,
-      data: item as Record<string, unknown>,
-      completed: isCompleted,
-    })
+    setBoundedMapEntry(
+      threadItems,
+      itemId,
+      {
+        id: itemId,
+        type: itemType,
+        turnId,
+        data: item as Record<string, unknown>,
+        completed: isCompleted,
+      },
+      CAPTURED_ITEM_PER_THREAD_LIMIT,
+    )
   }
 
   mergeItemsIntoTurns(threadId: string, turns: unknown[]): unknown[] {
-    const capturedMap = this.capturedItemsByThreadId.get(threadId)
+    const capturedMap = getAndTouchMapEntry(this.capturedItemsByThreadId, threadId)
     if (!capturedMap || capturedMap.size === 0) return turns
 
     const itemsByTurnId = new Map<string, CapturedItem[]>()
@@ -6912,6 +6962,15 @@ class AppServerProcess {
     return Array.from(this.pendingServerRequests.values())
   }
 
+  private clearCachedThreadState(): void {
+    this.streamEventsByThreadId.clear()
+    this.lastThreadReadSnapshotByThreadId.clear()
+    this.threadTurnPageReadCacheByThreadId.clear()
+    this.threadTurnPageReadPromiseByThreadId.clear()
+    this.capturedItemsByThreadId.clear()
+    this.liveStateCache.clear()
+  }
+
   dispose(): void {
     if (!this.process) return
 
@@ -6929,6 +6988,7 @@ class AppServerProcess {
     }
     this.pending.clear()
     this.pendingServerRequests.clear()
+    this.clearCachedThreadState()
 
     try {
       proc.stdin.end()

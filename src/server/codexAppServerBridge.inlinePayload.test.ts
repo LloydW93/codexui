@@ -5,6 +5,7 @@ import {
   mergeSessionSkillInputsIntoTurns,
   parseAutomationToml,
   sanitizeThreadTurnsInlinePayloads,
+  setBoundedMapEntry,
   toAutomationApiRecord,
 } from './codexAppServerBridge'
 
@@ -17,6 +18,28 @@ const webpBase64 = 'UklGRiIAAABXRUJQVlA4IC4AAAAwAQCdASoBAAEAAQAcJaQAA3AA/vuUAAA=
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
+})
+
+describe('bounded cache helpers', () => {
+  it('evicts the oldest map entries and refreshes updated keys', () => {
+    const cache = new Map<string, number>()
+    setBoundedMapEntry(cache, 'a', 1, 2)
+    setBoundedMapEntry(cache, 'b', 2, 2)
+    setBoundedMapEntry(cache, 'a', 3, 2)
+    setBoundedMapEntry(cache, 'c', 4, 2)
+
+    expect([...cache.entries()]).toEqual([
+      ['a', 3],
+      ['c', 4],
+    ])
+  })
+
+  it('clears maps when the cache limit is zero', () => {
+    const cache = new Map<string, number>([['a', 1]])
+    setBoundedMapEntry(cache, 'b', 2, 0)
+
+    expect([...cache.entries()]).toEqual([])
+  })
 })
 
 function localImagePathFromProxyUrl(value: string): string {
