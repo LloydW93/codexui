@@ -4445,9 +4445,7 @@ export function useDesktopState() {
       loadedThreadListGroups = hasLoadedThreads.value
         ? mergeThreadGroupPages(loadedThreadListGroups, groups)
         : groups
-      threadListNextCursor = hasLoadedThreads.value && !hasLoadedAllThreadPages
-        ? threadListNextCursor
-        : page.nextCursor
+      threadListNextCursor = page.nextCursor
       hasLoadedAllThreadPages = page.nextCursor === null
       isThreadListFullyLoaded.value = hasLoadedAllThreadPages
       await hydrateWorkspaceRootsStateIfNeeded(groups, rootsState)

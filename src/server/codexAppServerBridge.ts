@@ -228,8 +228,6 @@ const COMPOSIO_CONNECTORS_PAGE_LIMIT_MAX = 1000
 const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
 const THREAD_RESPONSE_TURN_LIMIT = 10
-const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
-const THREAD_TURN_PAGE_READ_CACHE_LIMIT = 6
 const THREAD_READ_SNAPSHOT_CACHE_LIMIT = 4
 const THREAD_LIVE_STATE_CACHE_LIMIT = 4
 const STREAM_EVENT_THREAD_BUFFER_LIMIT = 32
@@ -237,7 +235,8 @@ const CAPTURED_ITEM_THREAD_LIMIT = 32
 const CAPTURED_ITEM_PER_THREAD_LIMIT = 200
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
-const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
+const THREAD_SEARCH_SUMMARY_PAGE_LIMIT = 100
+const THREAD_SEARCH_SUMMARY_PAGE_COUNT_LIMIT = 5
 const PROJECTLESS_THREAD_DIRECTORY_MAX_ATTEMPTS = 100
 const PROJECTLESS_THREAD_READABLE_DIRECTORY_ATTEMPTS = 20
 const PROJECTLESS_THREAD_SLUG_MAX_LENGTH = 80
@@ -975,6 +974,22 @@ export function isEmptyThreadReadError(error: unknown): boolean {
 export function isThreadMaterializationPendingError(error: unknown): boolean {
   const message = getErrorMessage(error, '').toLowerCase()
   return message.includes('not materialized yet') && message.includes('includeturns is unavailable before first user message')
+}
+
+export function buildThreadMaterializationPendingReadResult(threadId: string): {
+  thread: {
+    id: string
+    turns: []
+    status: { type: 'inProgress' }
+  }
+} {
+  return {
+    thread: {
+      id: threadId,
+      turns: [],
+      status: { type: 'inProgress' },
+    },
+  }
 }
 
 export function isThreadNotFoundError(error: unknown): boolean {
@@ -2473,44 +2488,6 @@ async function readProviderModelIdsForProvider(
   }
 
   return readProviderBackedModelIds(appServer)
-}
-
-function extractThreadMessageText(threadReadPayload: unknown): string {
-  const payload = asRecord(threadReadPayload)
-  const thread = asRecord(payload?.thread)
-  const turns = Array.isArray(thread?.turns) ? thread.turns : []
-  const parts: string[] = []
-
-  for (const turn of turns) {
-    const turnRecord = asRecord(turn)
-    const items = Array.isArray(turnRecord?.items) ? turnRecord.items : []
-    for (const item of items) {
-      const itemRecord = asRecord(item)
-      const type = typeof itemRecord?.type === 'string' ? itemRecord.type : ''
-      if (type === 'agentMessage' && typeof itemRecord?.text === 'string' && itemRecord.text.trim().length > 0) {
-        parts.push(itemRecord.text.trim())
-        continue
-      }
-      if (type === 'userMessage') {
-        const content = Array.isArray(itemRecord?.content) ? itemRecord.content : []
-        for (const block of content) {
-          const blockRecord = asRecord(block)
-          if (blockRecord?.type === 'text' && typeof blockRecord.text === 'string' && blockRecord.text.trim().length > 0) {
-            parts.push(blockRecord.text.trim())
-          }
-        }
-        continue
-      }
-      if (type === 'commandExecution') {
-        const command = typeof itemRecord?.command === 'string' ? itemRecord.command.trim() : ''
-        const output = typeof itemRecord?.aggregatedOutput === 'string' ? itemRecord.aggregatedOutput.trim() : ''
-        if (command) parts.push(command)
-        if (output) parts.push(output)
-      }
-    }
-  }
-
-  return parts.join('\n').trim()
 }
 
 function readNonEmptyString(value: unknown): string {
@@ -6414,7 +6391,6 @@ class AppServerProcess {
   private readonly pendingServerRequests = new Map<number, PendingServerRequest>()
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
   private readonly lastThreadReadSnapshotByThreadId = new Map<string, unknown>()
-  private readonly threadTurnPageReadCacheByThreadId = new Map<string, { result: unknown; expiresAt: number }>()
   private readonly threadTurnPageReadPromiseByThreadId = new Map<string, Promise<unknown>>()
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
   private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
@@ -6570,7 +6546,6 @@ class AppServerProcess {
     const nThreadId = this.extractThreadIdFromParams(notification.params)
     if (nThreadId) {
       this.invalidateLiveStateCache(nThreadId)
-      this.threadTurnPageReadCacheByThreadId.delete(nThreadId)
     }
     for (const listener of this.notificationListeners) {
       listener(notification)
@@ -6627,7 +6602,6 @@ class AppServerProcess {
 
   storeThreadReadSnapshot(threadId: string, snapshot: unknown): void {
     setBoundedMapEntry(this.lastThreadReadSnapshotByThreadId, threadId, snapshot, THREAD_READ_SNAPSHOT_CACHE_LIMIT)
-    this.threadTurnPageReadCacheByThreadId.delete(threadId)
   }
 
   getLastThreadReadSnapshot(threadId: string): unknown | null {
@@ -6635,28 +6609,12 @@ class AppServerProcess {
   }
 
   async readThreadForTurnPage(threadId: string): Promise<unknown> {
-    const now = Date.now()
-    const cached = getAndTouchMapEntry(this.threadTurnPageReadCacheByThreadId, threadId)
-    if (cached && cached.expiresAt > now) return cached.result
-    if (cached) this.threadTurnPageReadCacheByThreadId.delete(threadId)
-
     const pending = this.threadTurnPageReadPromiseByThreadId.get(threadId)
     if (pending) return pending
 
     const promise = this.rpc('thread/read', {
       threadId,
       includeTurns: true,
-    }).then((result) => {
-      setBoundedMapEntry(
-        this.threadTurnPageReadCacheByThreadId,
-        threadId,
-        {
-          result,
-          expiresAt: Date.now() + THREAD_TURN_PAGE_READ_CACHE_TTL_MS,
-        },
-        THREAD_TURN_PAGE_READ_CACHE_LIMIT,
-      )
-      return result
     }).finally(() => {
       this.threadTurnPageReadPromiseByThreadId.delete(threadId)
     })
@@ -6965,7 +6923,6 @@ class AppServerProcess {
   private clearCachedThreadState(): void {
     this.streamEventsByThreadId.clear()
     this.lastThreadReadSnapshotByThreadId.clear()
-    this.threadTurnPageReadCacheByThreadId.clear()
     this.threadTurnPageReadPromiseByThreadId.clear()
     this.capturedItemsByThreadId.clear()
     this.liveStateCache.clear()
@@ -7422,18 +7379,20 @@ function getSharedBridgeState(): SharedBridgeState {
   return created
 }
 
-async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<ThreadSearchDocument[]> {
-  const threads: Array<{ id: string; title: string; preview: string }> = []
+export async function loadThreadSummariesForSearch(appServer: RpcExecutor): Promise<ThreadSearchDocument[]> {
+  const docs: ThreadSearchDocument[] = []
   let cursor: string | null = null
+  let pageCount = 0
 
   do {
     const response = asRecord(await appServer.rpc('thread/list', {
       archived: false,
-      limit: 100,
+      limit: THREAD_SEARCH_SUMMARY_PAGE_LIMIT,
       sortKey: 'updated_at',
       modelProviders: [],
       cursor,
     }))
+    pageCount += 1
     const data = Array.isArray(response?.data) ? response.data : []
     for (const row of data) {
       const record = asRecord(row)
@@ -7443,57 +7402,22 @@ async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<Thr
         ? record.name.trim()
         : (typeof record?.preview === 'string' && record.preview.trim().length > 0 ? record.preview.trim() : 'Untitled thread')
       const preview = typeof record?.preview === 'string' ? record.preview : ''
-      threads.push({ id, title, preview })
+      docs.push({
+        id,
+        title,
+        preview,
+        messageText: '',
+        searchableText: [title, preview].filter(Boolean).join('\n'),
+      })
     }
     cursor = typeof response?.nextCursor === 'string' && response.nextCursor.length > 0 ? response.nextCursor : null
-  } while (cursor)
+  } while (cursor && pageCount < THREAD_SEARCH_SUMMARY_PAGE_COUNT_LIMIT)
 
-  const docs: ThreadSearchDocument[] = threads.map((thread) => {
-    const searchableText = [thread.title, thread.preview].filter(Boolean).join('\n')
-    return {
-      id: thread.id,
-      title: thread.title,
-      preview: thread.preview,
-      messageText: '',
-      searchableText,
-    } satisfies ThreadSearchDocument
-  })
-
-  const docsById = new Map<string, ThreadSearchDocument>(docs.map((doc) => [doc.id, doc]))
-  const fullTextThreads = threads.slice(0, THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT)
-  const concurrency = 4
-  for (let offset = 0; offset < fullTextThreads.length; offset += concurrency) {
-    const batch = fullTextThreads.slice(offset, offset + concurrency)
-    const loaded = await Promise.all(batch.map(async (thread) => {
-      try {
-        const readResponse = await appServer.rpc('thread/read', {
-          threadId: thread.id,
-          includeTurns: true,
-        })
-        const messageText = extractThreadMessageText(readResponse)
-        const searchableText = [thread.title, thread.preview, messageText].filter(Boolean).join('\n')
-        return [thread.id, {
-          id: thread.id,
-          title: thread.title,
-          preview: thread.preview,
-          messageText,
-          searchableText,
-        } satisfies ThreadSearchDocument] as const
-      } catch {
-        return null
-      }
-    }))
-    for (const row of loaded) {
-      if (!row) continue
-      docsById.set(row[0], row[1])
-    }
-  }
-
-  return Array.from(docsById.values())
+  return docs
 }
 
 async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<ThreadSearchIndex> {
-  const docs = await loadAllThreadsForSearch(appServer)
+  const docs = await loadThreadSummariesForSearch(appServer)
   const docsById = new Map<string, ThreadSearchDocument>(docs.map((doc) => [doc.id, doc]))
   return { docsById }
 }
@@ -8006,37 +7930,31 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         try {
           rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
         } catch (error) {
-	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
-	            setJson(res, 200, { result: null })
-	            return
-	          }
-		          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
-		            const params = asRecord(body.params)
-		            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
-		            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
-		            if (snapshot) {
-		              setJson(res, 200, { result: snapshot })
-		              return
-		            }
-		          }
+          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
+            setJson(res, 200, { result: null })
+            return
+          }
+          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
+            const params = asRecord(body.params)
+            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
+            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
+            if (snapshot) {
+              setJson(res, 200, { result: snapshot })
+              return
+            }
+          }
           if (body.method === 'thread/read' && isThreadMaterializationPendingError(error)) {
             const params = asRecord(body.params)
             const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
             if (threadId) {
               setJson(res, 200, {
-                result: {
-                  thread: {
-                    id: threadId,
-                    turns: [],
-                    status: { type: 'inProgress' },
-                  },
-                },
+                result: buildThreadMaterializationPendingReadResult(threadId),
               })
               return
             }
           }
-		          throw error
-		        }
+          throw error
+        }
         const trimmedResult = trimThreadTurnsInRpcResult(body.method, rpcResult)
         const errorMergedResult = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
@@ -8119,6 +8037,17 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             hasMoreOlder: startIndex > 0,
           })
         } catch (error) {
+          if (isThreadMaterializationPendingError(error)) {
+            const threadId = url.searchParams.get('threadId')?.trim() ?? ''
+            if (threadId) {
+              setJson(res, 200, {
+                result: buildThreadMaterializationPendingReadResult(threadId),
+                startTurnIndex: 0,
+                hasMoreOlder: false,
+              })
+              return
+            }
+          }
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load earlier thread messages') })
         }
         return

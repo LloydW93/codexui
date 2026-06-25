@@ -486,7 +486,7 @@
             <template #left>
               <span class="thread-show-more-spacer" />
             </template>
-            <button class="thread-show-more-button" type="button" @click="onProjectShowMoreClick(group.projectName)">
+            <button class="thread-show-more-button" type="button" @click="onProjectShowMoreClick(group)">
               {{ projectShowMoreLabel(group) }}
             </button>
           </SidebarMenuRow>
@@ -998,6 +998,7 @@ type DragPointerSample = {
 
 type MenuDirection = 'up' | 'down'
 type ChatSortMode = 'created' | 'updated'
+type ThreadSortTimestampKey = 'createdAtIso' | 'updatedAtIso'
 type AutomationScheduleMode = 'daily' | 'interval' | 'advanced'
 type AutomationIntervalUnit = 'minutes' | 'hours' | 'days'
 type AutomationTargetMode = 'thread' | 'project'
@@ -1007,6 +1008,11 @@ type AutomationScheduleDraft = {
   dailyTime: string
   interval: number
   intervalUnit: AutomationIntervalUnit
+}
+
+type ThreadWindow = {
+  rows: UiThread[]
+  hasMore: boolean
 }
 
 const DRAG_START_THRESHOLD_PX = 4
@@ -1291,77 +1297,155 @@ function threadMatchesSearch(thread: UiThread): boolean {
   return thread.title.toLowerCase().includes(q) || thread.preview.toLowerCase().includes(q)
 }
 
+function threadTimestamp(thread: UiThread, key: ThreadSortTimestampKey): number {
+  return new Date(thread[key] || thread.updatedAtIso || thread.createdAtIso).getTime() || 0
+}
+
+function compareThreadsByTimestampDesc(first: UiThread, second: UiThread, key: ThreadSortTimestampKey): number {
+  const byTimestamp = threadTimestamp(second, key) - threadTimestamp(first, key)
+  if (byTimestamp !== 0) return byTimestamp
+  return first.id.localeCompare(second.id)
+}
+
+function insertSortedThreadWindowRow(
+  rows: UiThread[],
+  thread: UiThread,
+  maxRows: number,
+  key: ThreadSortTimestampKey,
+): void {
+  if (maxRows <= 0) return
+  const insertAt = rows.findIndex((existing) => compareThreadsByTimestampDesc(thread, existing, key) < 0)
+  if (insertAt >= 0) rows.splice(insertAt, 0, thread)
+  else rows.push(thread)
+  if (rows.length > maxRows) rows.pop()
+}
+
+function collectSortedThreadWindow(
+  predicate: (thread: UiThread) => boolean,
+  limit: number,
+  key: ThreadSortTimestampKey,
+): ThreadWindow {
+  const visibleLimit = Math.max(0, Math.floor(limit))
+  const maxRows = visibleLimit + 1
+  const rows: UiThread[] = []
+
+  for (const group of props.groups) {
+    for (const thread of group.threads) {
+      if (!predicate(thread)) continue
+      insertSortedThreadWindowRow(rows, thread, maxRows, key)
+    }
+  }
+
+  return {
+    rows,
+    hasMore: rows.length > visibleLimit,
+  }
+}
+
+function collectProjectThreadWindow(group: UiProjectGroup, limit: number): ThreadWindow {
+  const visibleLimit = Math.max(0, Math.floor(limit))
+  const rows: UiThread[] = []
+
+  for (const thread of group.threads) {
+    if (isProjectlessChatPath(thread.cwd)) continue
+    if (pinnedThreadIdSet.value.has(thread.id)) continue
+    if (optimisticallyArchivedThreadIdSet.value.has(thread.id)) continue
+    if (!threadMatchesSearch(thread)) continue
+    rows.push(thread)
+    if (rows.length > visibleLimit) break
+  }
+
+  return {
+    rows,
+    hasMore: rows.length > visibleLimit,
+  }
+}
+
+function hasAnyNonArchivedProjectThread(group: UiProjectGroup): boolean {
+  return group.threads.some((thread) => (
+    !isProjectlessChatPath(thread.cwd) &&
+    !optimisticallyArchivedThreadIdSet.value.has(thread.id)
+  ))
+}
+
 const filteredGroups = computed<UiProjectGroup[]>(() => {
   return props.groups.flatMap((group) => {
-    const threads = group.threads.filter((thread) => !isProjectlessChatPath(thread.cwd) && threadMatchesSearch(thread))
+    const { rows: threads } = collectProjectThreadWindow(group, projectThreadVisibleLimit(group.projectName))
     if (threads.length > 0) return [{ ...group, threads }]
-    return !isSearchActive.value && group.threads.length === 0 ? [{ ...group, threads }] : []
+    return !isSearchActive.value && (group.threads.length === 0 || hasAnyNonArchivedProjectThread(group))
+      ? [{ ...group, threads }]
+      : []
   })
 })
 
 const isChronologicalView = computed(() => threadViewMode.value === 'chronological')
 
-const globalThreads = computed<UiThread[]>(() => {
-  const rows: UiThread[] = []
-
-  for (const group of props.groups) {
-    for (const thread of group.threads) {
-      if (pinnedThreadIdSet.value.has(thread.id)) continue
-      if (!threadMatchesSearch(thread)) continue
-      rows.push(thread)
-    }
-  }
-
-  return rows.sort((first, second) => {
-    const firstTimestamp = new Date(first.updatedAtIso || first.createdAtIso).getTime()
-    const secondTimestamp = new Date(second.updatedAtIso || second.createdAtIso).getTime()
-    return secondTimestamp - firstTimestamp
-  })
+const chronologicalThreadWindow = computed<ThreadWindow>(() => {
+  return collectSortedThreadWindow(
+    (thread) => (
+      !pinnedThreadIdSet.value.has(thread.id) &&
+      !optimisticallyArchivedThreadIdSet.value.has(thread.id) &&
+      threadMatchesSearch(thread)
+    ),
+    chronologicalThreadVisibleLimit.value,
+    'updatedAtIso',
+  )
 })
 
 const visibleGlobalThreads = computed(() => {
-  return globalThreads.value.slice(0, chronologicalThreadVisibleLimit.value)
+  return chronologicalThreadWindow.value.rows.slice(0, chronologicalThreadVisibleLimit.value)
 })
 
 const hasHiddenGlobalThreads = computed(() => {
-  return globalThreads.value.length > visibleGlobalThreads.value.length ||
-    (chronologicalThreadVisibleLimit.value > CHRONOLOGICAL_THREAD_RENDER_STEP && globalThreads.value.length > CHRONOLOGICAL_THREAD_RENDER_STEP)
+  return chronologicalThreadWindow.value.hasMore ||
+    (chronologicalThreadVisibleLimit.value > CHRONOLOGICAL_THREAD_RENDER_STEP && visibleGlobalThreads.value.length > CHRONOLOGICAL_THREAD_RENDER_STEP)
 })
 
 const chronologicalShowMoreLabel = computed(() => (
-  chronologicalThreadVisibleLimit.value >= globalThreads.value.length &&
-    globalThreads.value.length > CHRONOLOGICAL_THREAD_RENDER_STEP
+  !chronologicalThreadWindow.value.hasMore &&
+    chronologicalThreadVisibleLimit.value > CHRONOLOGICAL_THREAD_RENDER_STEP &&
+    visibleGlobalThreads.value.length > CHRONOLOGICAL_THREAD_RENDER_STEP
     ? t('Show less')
     : t('Show more')
 ))
 
-const chatThreads = computed(() => {
-  const rows = globalThreads.value.filter((thread) => isProjectlessChatPath(thread.cwd))
-  const timestampKey = chatSortMode.value === 'created' ? 'createdAtIso' : 'updatedAtIso'
-  return rows
-    .sort((first, second) => {
-      const firstTimestamp = new Date(first[timestampKey] || first.updatedAtIso || first.createdAtIso).getTime()
-      const secondTimestamp = new Date(second[timestampKey] || second.updatedAtIso || second.createdAtIso).getTime()
-      return secondTimestamp - firstTimestamp
-    })
+const chatThreadWindowLimit = computed(() => {
+  if (isSearchActive.value) return Math.max(chatThreadVisibleLimit.value, SEARCH_THREAD_RENDER_STEP)
+  if (!isChatsListExpanded.value) return COLLAPSED_PROJECT_THREAD_LIMIT
+  return chatThreadVisibleLimit.value
 })
 
+const chatThreadWindow = computed<ThreadWindow>(() => {
+  const timestampKey: ThreadSortTimestampKey = chatSortMode.value === 'created' ? 'createdAtIso' : 'updatedAtIso'
+  return collectSortedThreadWindow(
+    (thread) => (
+      isProjectlessChatPath(thread.cwd) &&
+      !pinnedThreadIdSet.value.has(thread.id) &&
+      !optimisticallyArchivedThreadIdSet.value.has(thread.id) &&
+      threadMatchesSearch(thread)
+    ),
+    chatThreadWindowLimit.value,
+    timestampKey,
+  )
+})
+
+const chatThreads = computed(() => chatThreadWindow.value.rows)
+
 const visibleChatThreads = computed(() => {
-  if (isSearchActive.value) {
-    return chatThreads.value.slice(0, Math.max(chatThreadVisibleLimit.value, SEARCH_THREAD_RENDER_STEP))
-  }
-  if (!isChatsListExpanded.value) return chatThreads.value.slice(0, COLLAPSED_PROJECT_THREAD_LIMIT)
-  return chatThreads.value.slice(0, chatThreadVisibleLimit.value)
+  return chatThreads.value.slice(0, chatThreadWindowLimit.value)
 })
 
 const hasHiddenChatThreads = computed(() => {
-  if (isSearchActive.value) return chatThreads.value.length > visibleChatThreads.value.length
-  return chatThreads.value.length > visibleChatThreads.value.length ||
-    (isChatsListExpanded.value && chatThreads.value.length > COLLAPSED_PROJECT_THREAD_LIMIT)
+  if (isSearchActive.value) return chatThreadWindow.value.hasMore
+  return chatThreadWindow.value.hasMore ||
+    (isChatsListExpanded.value && visibleChatThreads.value.length > COLLAPSED_PROJECT_THREAD_LIMIT)
 })
 
 const chatShowMoreLabel = computed(() => (
-  !isSearchActive.value && isChatsListExpanded.value && visibleChatThreads.value.length >= chatThreads.value.length
+  !isSearchActive.value &&
+    isChatsListExpanded.value &&
+    !chatThreadWindow.value.hasMore &&
+    visibleChatThreads.value.length > COLLAPSED_PROJECT_THREAD_LIMIT
     ? t('Show less')
     : t('Show more')
 ))
@@ -1473,14 +1557,6 @@ const threadProjectNameById = computed(() => {
     for (const thread of group.threads) {
       map.set(thread.id, group.projectName)
     }
-  }
-  return map
-})
-const unpinnedThreadsByProjectName = computed(() => {
-  const map = new Map<string, UiThread[]>()
-  for (const group of props.groups) {
-    const rows = group.threads.filter((thread) => !pinnedThreadIdSet.value.has(thread.id) && !optimisticallyArchivedThreadIdSet.value.has(thread.id))
-    map.set(group.projectName, rows)
   }
   return map
 })
@@ -2449,14 +2525,15 @@ function omitProjectLimit(projectName: string): Record<string, number> {
   return next
 }
 
-function onProjectShowMoreClick(projectName: string): void {
-  const rows = projectThreadsByName(projectName)
+function onProjectShowMoreClick(group: UiProjectGroup): void {
+  const projectName = group.projectName
+  const rows = projectThreads(group)
   const currentLimit = projectThreadVisibleLimit(projectName)
 
   if (isSearchActive.value) {
     projectThreadVisibleLimitByName.value = {
       ...projectThreadVisibleLimitByName.value,
-      [projectName]: Math.min(rows.length, currentLimit + SEARCH_THREAD_RENDER_STEP),
+      [projectName]: currentLimit + SEARCH_THREAD_RENDER_STEP,
     }
     return
   }
@@ -2468,7 +2545,7 @@ function onProjectShowMoreClick(projectName: string): void {
     }
     projectThreadVisibleLimitByName.value = {
       ...projectThreadVisibleLimitByName.value,
-      [projectName]: Math.min(rows.length, PROJECT_THREAD_RENDER_STEP),
+      [projectName]: PROJECT_THREAD_RENDER_STEP,
     }
     return
   }
@@ -2476,7 +2553,7 @@ function onProjectShowMoreClick(projectName: string): void {
   if (currentLimit < rows.length) {
     projectThreadVisibleLimitByName.value = {
       ...projectThreadVisibleLimitByName.value,
-      [projectName]: Math.min(rows.length, currentLimit + PROJECT_THREAD_RENDER_STEP),
+      [projectName]: currentLimit + PROJECT_THREAD_RENDER_STEP,
     }
     return
   }
@@ -2500,7 +2577,7 @@ function toggleChatsListExpansion(): void {
     return
   }
 
-  if (chatThreadVisibleLimit.value < chatThreads.value.length) {
+  if (chatThreadWindow.value.hasMore) {
     chatThreadVisibleLimit.value += CHAT_THREAD_RENDER_STEP
     return
   }
@@ -2510,7 +2587,7 @@ function toggleChatsListExpansion(): void {
 }
 
 function toggleChronologicalListExpansion(): void {
-  if (chronologicalThreadVisibleLimit.value < globalThreads.value.length) {
+  if (chronologicalThreadWindow.value.hasMore) {
     chronologicalThreadVisibleLimit.value += isSearchActive.value
       ? SEARCH_THREAD_RENDER_STEP
       : CHRONOLOGICAL_THREAD_RENDER_STEP
@@ -3036,11 +3113,7 @@ function projectGroupStyle(projectName: string): Record<string, string> | undefi
 }
 
 function projectThreads(group: UiProjectGroup): UiThread[] {
-  return unpinnedThreadsByProjectName.value.get(group.projectName) ?? []
-}
-
-function projectThreadsByName(projectName: string): UiThread[] {
-  return unpinnedThreadsByProjectName.value.get(projectName) ?? []
+  return group.threads
 }
 
 function projectThreadVisibleLimit(projectName: string): number {
@@ -3067,8 +3140,7 @@ function hasHiddenThreads(group: UiProjectGroup): boolean {
 }
 
 function projectShowMoreLabel(group: UiProjectGroup): string {
-  const rows = projectThreads(group)
-  if (!isSearchActive.value && isExpanded(group.projectName) && visibleThreads(group).length >= rows.length) {
+  if (!isSearchActive.value && isExpanded(group.projectName) && !hasHiddenThreads(group)) {
     return t('Show less')
   }
   return t('Show more')

@@ -635,6 +635,41 @@ describe('startup request deduplication', () => {
     expect(state.projectGroups.value.flatMap((group) => group.threads.map((row) => row.id)).sort()).toEqual(['thread-1', 'thread-2'])
   })
 
+  it('uses the refreshed first-page cursor for later explicit pagination', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+        nextCursor: 'cursor-2',
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('thread-2', '/tmp/project')] }],
+        nextCursor: 'stale-cursor-3',
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('thread-0', '/tmp/project')] }],
+        nextCursor: 'fresh-cursor-2',
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('thread-fresh-2', '/tmp/project')] }],
+        nextCursor: null,
+      })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.loadMoreThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
+    await state.loadMoreThreads()
+
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenNthCalledWith(1)
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenNthCalledWith(2, 'cursor-2', 100)
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenNthCalledWith(3)
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenNthCalledWith(4, 'fresh-cursor-2', 100)
+    expect(
+      state.projectGroups.value.flatMap((group) => group.threads.map((row) => row.id)).sort(),
+    ).toEqual(['thread-0', 'thread-1', 'thread-2', 'thread-fresh-2'])
+  })
+
   it('reuses a just-loaded skills list for the same selected cwd', async () => {
     installTestWindow()
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1000)

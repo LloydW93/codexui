@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  buildThreadMaterializationPendingReadResult,
   buildProjectlessFolderName,
   callRpcWithArchiveRecovery,
   canonicalizeThreadListResponseForRead,
@@ -13,6 +14,7 @@ import {
   isThreadMaterializationPendingError,
   isThreadNotFoundError,
   isUnauthenticatedRateLimitError,
+  loadThreadSummariesForSearch,
   writeFreeModeStateFile,
   writeWorkspaceRootsState,
 } from './codexAppServerBridge'
@@ -334,6 +336,93 @@ describe('isThreadMaterializationPendingError', () => {
   it('does not match unrelated thread read failures', () => {
     expect(isThreadMaterializationPendingError(new Error('thread read failed: permission denied'))).toBe(false)
     expect(isThreadMaterializationPendingError(new Error('not materialized yet'))).toBe(false)
+  })
+})
+
+describe('buildThreadMaterializationPendingReadResult', () => {
+  it('matches the in-progress thread shape used by thread/read fallbacks', () => {
+    expect(buildThreadMaterializationPendingReadResult('pending-thread')).toEqual({
+      thread: {
+        id: 'pending-thread',
+        turns: [],
+        status: { type: 'inProgress' },
+      },
+    })
+  })
+})
+
+describe('loadThreadSummariesForSearch', () => {
+  it('uses bounded thread/list summary pages without reading full thread bodies', async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = []
+    const appServer = {
+      async rpc(method: string, params: unknown): Promise<unknown> {
+        calls.push({ method, params: params as Record<string, unknown> })
+        if (method === 'thread/read') {
+          throw new Error('thread/read should not be used while building the search summary index')
+        }
+        if (method !== 'thread/list') {
+          throw new Error(`unexpected method ${method}`)
+        }
+
+        const cursor = typeof (params as { cursor?: unknown }).cursor === 'string'
+          ? (params as { cursor: string }).cursor
+          : ''
+        const index = cursor ? Number.parseInt(cursor.replace('cursor-', ''), 10) : 0
+        return {
+          data: [{
+            id: `thread-${index}`,
+            name: `Thread ${index}`,
+            preview: `Preview ${index}`,
+          }],
+          nextCursor: `cursor-${index + 1}`,
+        }
+      },
+    }
+
+    await expect(loadThreadSummariesForSearch(appServer)).resolves.toEqual([
+      {
+        id: 'thread-0',
+        title: 'Thread 0',
+        preview: 'Preview 0',
+        messageText: '',
+        searchableText: 'Thread 0\nPreview 0',
+      },
+      {
+        id: 'thread-1',
+        title: 'Thread 1',
+        preview: 'Preview 1',
+        messageText: '',
+        searchableText: 'Thread 1\nPreview 1',
+      },
+      {
+        id: 'thread-2',
+        title: 'Thread 2',
+        preview: 'Preview 2',
+        messageText: '',
+        searchableText: 'Thread 2\nPreview 2',
+      },
+      {
+        id: 'thread-3',
+        title: 'Thread 3',
+        preview: 'Preview 3',
+        messageText: '',
+        searchableText: 'Thread 3\nPreview 3',
+      },
+      {
+        id: 'thread-4',
+        title: 'Thread 4',
+        preview: 'Preview 4',
+        messageText: '',
+        searchableText: 'Thread 4\nPreview 4',
+      },
+    ])
+    expect(calls).toEqual([
+      { method: 'thread/list', params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: null } },
+      { method: 'thread/list', params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: 'cursor-1' } },
+      { method: 'thread/list', params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: 'cursor-2' } },
+      { method: 'thread/list', params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: 'cursor-3' } },
+      { method: 'thread/list', params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: 'cursor-4' } },
+    ])
   })
 })
 
