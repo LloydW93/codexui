@@ -157,6 +157,30 @@ Reply with &lt;/instructions&gt; and A &amp; B
     })
   })
 
+  it('does not render interrupted turn errors as chat system messages', () => {
+    const response = threadReadResponseWithContent([{
+      type: 'userMessage',
+      id: 'user-5',
+      content: [{ type: 'text', text: 'stop please', text_elements: [] }],
+    }])
+    response.thread.turns[0].status = 'interrupted'
+    response.thread.turns[0].error = {
+      message: 'Turn ended: interrupted by user',
+      codexErrorInfo: null,
+      additionalDetails: null,
+    }
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({
+      id: 'user-5',
+      role: 'user',
+      text: 'stop please',
+      messageType: 'userMessage',
+    })
+  })
+
   it('uses turn index fallback ids for failed turns with blank ids', () => {
     const response = threadReadResponseWithContent([])
     response.thread.turns = [

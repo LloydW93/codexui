@@ -848,6 +848,7 @@ type TurnStartedInfo = {
 type TurnCompletedInfo = {
   threadId: string
   turnId: string
+  status: 'completed' | 'failed' | 'declined' | 'interrupted'
   completedAtMs: number
   startedAtMs?: number
 }
@@ -882,6 +883,15 @@ function formatTurnDuration(durationMs: number): string {
   const displaySeconds = seconds > 0 || parts.length === 0 ? seconds : 0
   parts.push(`${displaySeconds}s`)
   return parts.join(' ')
+}
+
+function isInterruptTerminalErrorMessage(message: string): boolean {
+  const normalized = normalizeMessageText(message).toLowerCase()
+  if (!normalized) return false
+  return (
+    normalized.startsWith('turn ended') ||
+    /\b(interrupt(?:ed|ion)?|cancel(?:led|ed|lation)?|abort(?:ed)?|stopped)\b/u.test(normalized)
+  )
 }
 
 function areTurnSummariesEqual(first?: TurnSummaryState, second?: TurnSummaryState): boolean {
@@ -1661,6 +1671,7 @@ export function useDesktopState() {
   let activeReasoningItemId = ''
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
+  const locallyInterruptedTurnIdByThreadId = new Map<string, string>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
 
 
@@ -2438,6 +2449,11 @@ export function useDesktopState() {
     turnActivityByThreadId.value = pruneThreadStateMap(turnActivityByThreadId.value, activeThreadIds)
     turnErrorByThreadId.value = pruneThreadStateMap(turnErrorByThreadId.value, activeThreadIds)
     activeTurnIdByThreadId.value = pruneThreadStateMap(activeTurnIdByThreadId.value, activeThreadIds)
+    for (const threadId of locallyInterruptedTurnIdByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) {
+        locallyInterruptedTurnIdByThreadId.delete(threadId)
+      }
+    }
     interruptBlockedUntilPersistedByThreadId.value = pruneThreadStateMap(
       interruptBlockedUntilPersistedByThreadId.value,
       activeThreadIds,
@@ -2492,6 +2508,21 @@ export function useDesktopState() {
         turnSummaryByThreadId.value = omitKey(turnSummaryByThreadId.value, threadId)
       }
     }
+  }
+
+  function rememberLocallyInterruptedTurn(threadId: string, turnId: string): void {
+    if (!threadId || !turnId) return
+    locallyInterruptedTurnIdByThreadId.set(threadId, turnId)
+  }
+
+  function isLocallyInterruptedTurn(threadId: string, turnId: string): boolean {
+    return Boolean(threadId && turnId && locallyInterruptedTurnIdByThreadId.get(threadId) === turnId)
+  }
+
+  function clearLocallyInterruptedTurn(threadId: string, turnId?: string): void {
+    if (!threadId) return
+    if (turnId && locallyInterruptedTurnIdByThreadId.get(threadId) !== turnId) return
+    locallyInterruptedTurnIdByThreadId.delete(threadId)
   }
 
   function setThreadInProgress(threadId: string, nextInProgress: boolean): void {
@@ -3507,10 +3538,19 @@ export function useDesktopState() {
       parseIsoTimestamp(readString(turnPayload?.startedAt)) ??
       parseIsoTimestamp(readString(params.startedAt)) ??
       undefined
+    const rawStatus = readString(turnPayload?.status) || readString(params.status)
+    const status = rawStatus === 'failed'
+      ? 'failed'
+      : rawStatus === 'declined'
+        ? 'declined'
+        : rawStatus === 'interrupted'
+          ? 'interrupted'
+          : 'completed'
 
     return {
       threadId,
       turnId,
+      status,
       completedAtMs,
       startedAtMs,
     }
@@ -3959,6 +3999,9 @@ export function useDesktopState() {
         [startedTurn.threadId]: startedTurn.turnId,
       }
       maybeUnblockInterruptForActiveTurn(startedTurn.threadId, startedTurn.turnId)
+      if (locallyInterruptedTurnIdByThreadId.get(startedTurn.threadId) !== startedTurn.turnId) {
+        clearLocallyInterruptedTurn(startedTurn.threadId)
+      }
       clearLivePlansForThread(startedTurn.threadId)
       clearLiveFileChangesForThread(startedTurn.threadId)
       setTurnSummaryForThread(startedTurn.threadId, null)
@@ -3995,10 +4038,15 @@ export function useDesktopState() {
         (startedTurnState ? completedTurn.completedAtMs - startedTurnState.startedAtMs : null)
 
       const durationMs = typeof rawDurationMs === 'number' ? Math.max(0, rawDurationMs) : 0
-      setTurnSummaryForThread(completedTurn.threadId, {
-        turnId: completedTurn.turnId,
-        durationMs,
-      })
+      const locallyInterruptedTurn = isLocallyInterruptedTurn(completedTurn.threadId, completedTurn.turnId)
+      if (completedTurn.status === 'interrupted' || locallyInterruptedTurn) {
+        setTurnSummaryForThread(completedTurn.threadId, null)
+      } else {
+        setTurnSummaryForThread(completedTurn.threadId, {
+          turnId: completedTurn.turnId,
+          durationMs,
+        })
+      }
       if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
         activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
       }
@@ -4013,15 +4061,32 @@ export function useDesktopState() {
 
     if (turnErrorMessage) {
       const failedThreadId = completedTurn?.threadId || extractThreadIdFromNotification(notification)
-      if (failedThreadId) {
-        setTurnErrorForThread(failedThreadId, turnErrorMessage)
-      }
-      error.value = turnErrorMessage
-      if (failedThreadId && shouldRetryWithFallback) {
-        void retryPendingTurnWithFallback(failedThreadId)
+      const shouldSuppressInterruptError = Boolean(
+        completedTurn &&
+        isLocallyInterruptedTurn(completedTurn.threadId, completedTurn.turnId) &&
+        isInterruptTerminalErrorMessage(turnErrorMessage),
+      )
+      if (shouldSuppressInterruptError) {
+        if (failedThreadId) {
+          setTurnErrorForThread(failedThreadId, null)
+        }
+        if (error.value === normalizeMessageText(turnErrorMessage)) {
+          error.value = ''
+        }
+      } else {
+        if (failedThreadId) {
+          setTurnErrorForThread(failedThreadId, turnErrorMessage)
+        }
+        error.value = turnErrorMessage
+        if (failedThreadId && shouldRetryWithFallback) {
+          void retryPendingTurnWithFallback(failedThreadId)
+        }
       }
     } else if (completedTurn) {
       setTurnErrorForThread(completedTurn.threadId, null)
+    }
+    if (completedTurn) {
+      clearLocallyInterruptedTurn(completedTurn.threadId, completedTurn.turnId)
     }
 
     if (notificationErrorState) {
@@ -5198,6 +5263,7 @@ export function useDesktopState() {
     const normalizedSkills = skills.map((skill) => ({ name: skill.name, path: skill.path }))
     const normalizedFileAttachments = fileAttachments.map((file) => ({ ...file }))
 
+    clearLocallyInterruptedTurn(threadId)
     setPendingTurnRequest(threadId, {
       text: normalizedText,
       imageUrls: [...normalizedImageUrls],
@@ -5326,6 +5392,7 @@ export function useDesktopState() {
     error.value = ''
     try {
       await interruptThreadTurn(threadId, turnId)
+      rememberLocallyInterruptedTurn(threadId, turnId)
       setThreadInProgress(threadId, false)
       setTurnActivityForThread(threadId, null)
       setTurnErrorForThread(threadId, null)
@@ -5727,6 +5794,7 @@ export function useDesktopState() {
     turnSummaryByThreadId.value = {}
     turnErrorByThreadId.value = {}
     activeTurnIdByThreadId.value = {}
+    locallyInterruptedTurnIdByThreadId.clear()
     interruptBlockedUntilPersistedByThreadId.value = {}
     threadListedByServerById.value = {}
     persistedUserMessageByThreadId.value = {}

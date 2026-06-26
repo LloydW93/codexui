@@ -14,6 +14,8 @@
 - No error appears saying `turn/interrupt requires turnId`.
 - Turn is interrupted successfully in both immediate-stop and resumed-thread scenarios.
 - Thread state exits in-progress and the stop control returns to idle.
+- No `Worked for ...` separator is inserted for the stopped turn.
+- No interrupt/cancel/turn-ended error row remains visible after Stop succeeds.
 
 #### Rollback/Cleanup
 - None.

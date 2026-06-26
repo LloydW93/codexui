@@ -986,6 +986,214 @@ describe('live error overlay', () => {
 
     expect(state.selectedLiveOverlay.value).toBe(null)
   })
+
+  it('does not add a worked separator for interrupted turn completions', async () => {
+    installTestWindow()
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue(null)
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          text: 'please continue',
+          messageType: 'userMessage',
+        },
+        {
+          id: 'assistant-1',
+          role: 'assistant',
+          text: 'Partial response',
+          messageType: 'agentMessage',
+        },
+      ],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      turnIndexByTurnId: {},
+      hasMoreOlder: false,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-interrupted')
+    await state.loadMessages('thread-interrupted')
+    state.startPolling()
+
+    notificationHandler?.({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-interrupted',
+        durationMs: 5000,
+        turn: {
+          id: 'turn-1',
+          status: 'interrupted',
+        },
+      },
+    })
+
+    expect(state.messages.value.some((message) => message.text.startsWith('Worked for '))).toBe(false)
+    expect(state.selectedLiveOverlay.value).toBe(null)
+  })
+
+  it('keeps late completed notifications after stop from adding a worked separator', async () => {
+    installTestWindow()
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue(null)
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-stop-completed', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            text: 'run for a while',
+            messageType: 'userMessage',
+          },
+        ],
+        inProgress: true,
+        activeTurnId: 'turn-stop',
+        turnIndexByTurnId: {},
+        hasMoreOlder: false,
+      })
+      .mockResolvedValue({
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            text: 'run for a while',
+            messageType: 'userMessage',
+          },
+        ],
+        inProgress: false,
+        activeTurnId: '',
+        turnIndexByTurnId: {},
+        hasMoreOlder: false,
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-stop-completed')
+    await state.loadMessages('thread-stop-completed')
+    state.startPolling()
+    await state.interruptSelectedThreadTurn()
+
+    notificationHandler?.({
+      method: 'turn/started',
+      params: {
+        threadId: 'thread-stop-completed',
+        turn: {
+          id: 'turn-stop',
+          startedAt: '2026-06-26T23:00:00.000Z',
+        },
+      },
+    })
+    notificationHandler?.({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-stop-completed',
+        durationMs: 9000,
+        turn: {
+          id: 'turn-stop',
+          status: 'completed',
+        },
+      },
+    })
+
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-stop-completed', 'turn-stop')
+    expect(state.messages.value.some((message) => message.text.startsWith('Worked for '))).toBe(false)
+    expect(state.selectedLiveOverlay.value).toBe(null)
+  })
+
+  it('suppresses interrupt-shaped failed completions only for the locally stopped turn', async () => {
+    installTestWindow()
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue(null)
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-stop-failed', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            text: 'run for a while',
+            messageType: 'userMessage',
+          },
+        ],
+        inProgress: true,
+        activeTurnId: 'turn-stop',
+        turnIndexByTurnId: {},
+        hasMoreOlder: false,
+      })
+      .mockResolvedValue({
+        messages: [
+          {
+            id: 'user-1',
+            role: 'user',
+            text: 'run for a while',
+            messageType: 'userMessage',
+          },
+        ],
+        inProgress: false,
+        activeTurnId: '',
+        turnIndexByTurnId: {},
+        hasMoreOlder: false,
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-stop-failed')
+    await state.loadMessages('thread-stop-failed')
+    state.startPolling()
+    await state.interruptSelectedThreadTurn()
+
+    notificationHandler?.({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-stop-failed',
+        turn: {
+          id: 'turn-stop',
+          status: 'failed',
+          error: { message: 'Turn ended: interrupted by user' },
+        },
+      },
+    })
+
+    expect(state.messages.value.some((message) => message.text.startsWith('Worked for '))).toBe(false)
+    expect(state.selectedLiveOverlay.value).toBe(null)
+
+    notificationHandler?.({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-stop-failed',
+        turn: {
+          id: 'turn-real-failure',
+          status: 'failed',
+          error: { message: 'real live failure' },
+        },
+      },
+    })
+
+    expect(state.selectedLiveOverlay.value?.errorText).toBe('real live failure')
+  })
 })
 
 describe('provider model selection', () => {
