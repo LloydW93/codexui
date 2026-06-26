@@ -1233,6 +1233,12 @@ import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, Telegra
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
+import {
+  hasDuplicateFolderLeaf,
+  isManagedWorktreePath,
+  resolvePreferredProjectCwd,
+  resolveWorkspaceRootCwdForProject,
+} from './workspaceProjectCwd.js'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
@@ -1880,16 +1886,6 @@ const threadContextSecondaryText = computed(() => {
 
 const threadContextTooltip = computed(() => buildThreadContextTooltip(selectedThreadTokenUsage.value))
 
-function hasDuplicateFolderLeaf(path: string, knownPaths: string[]): boolean {
-  const normalizedPath = normalizePathForUi(path).trim()
-  const leafName = getPathLeafName(normalizedPath)
-  if (!normalizedPath || !leafName) return false
-  return knownPaths.some((knownPath) => {
-    const normalizedKnownPath = normalizePathForUi(knownPath).trim()
-    return normalizedKnownPath !== normalizedPath && getPathLeafName(normalizedKnownPath) === leafName
-  })
-}
-
 function getFolderOptionLabel(path: string, fallbackLabel = ''): string {
   const normalizedPath = normalizePathForUi(path).trim()
   const explicitLabel = fallbackLabel.trim()
@@ -1921,22 +1917,11 @@ function getProjectOrderNameForPath(path: string): string {
 }
 
 function resolveWorkspaceRootCwd(projectName: string): string {
-  const normalizedProjectName = normalizePathForUi(projectName).trim()
-  if (!normalizedProjectName) return ''
-  const knownPaths = [
-    ...workspaceRootOptionsState.value.order,
-    ...projectGroups.value.map((group) => group.threads[0]?.cwd?.trim() ?? '').filter(Boolean),
-  ]
-  for (const cwdRaw of workspaceRootOptionsState.value.order) {
-    const cwd = normalizePathForUi(cwdRaw).trim()
-    if (!cwd) continue
-    const leafName = getPathLeafName(cwd)
-    const orderName = hasDuplicateFolderLeaf(cwd, knownPaths) ? cwd : leafName
-    if (cwd === normalizedProjectName || orderName === normalizedProjectName || leafName === normalizedProjectName) {
-      return cwd
-    }
-  }
-  return ''
+  return resolveWorkspaceRootCwdForProject({
+    projectName,
+    workspaceRootOrder: workspaceRootOptionsState.value.order,
+    projectGroups: projectGroups.value,
+  })
 }
 
 const newThreadFolderOptions = computed(() => {
@@ -2757,17 +2742,16 @@ async function onForkThread(threadId: string): Promise<void> {
 }
 
 function isWorktreePath(cwdRaw: string): boolean {
-  const cwd = cwdRaw.trim().replace(/\\/gu, '/')
-  if (!cwd) return false
-  return cwd.includes('/.codex/worktrees/') || cwd.includes('/.git/worktrees/')
+  return isManagedWorktreePath(cwdRaw)
 }
 
 function resolvePreferredLocalCwd(projectName: string, fallbackCwd = ''): string {
-  const group = projectGroups.value.find((row) => row.projectName === projectName)
-  if (!group) return resolveWorkspaceRootCwd(projectName) || fallbackCwd.trim()
-  const nonWorktreeThread = group.threads.find((thread) => !thread.hasWorktree)
-  const candidate = nonWorktreeThread?.cwd?.trim() ?? group.threads[0]?.cwd?.trim() ?? ''
-  return candidate || resolveWorkspaceRootCwd(projectName) || fallbackCwd.trim()
+  return resolvePreferredProjectCwd({
+    projectName,
+    fallbackCwd,
+    workspaceRootOrder: workspaceRootOptionsState.value.order,
+    projectGroups: projectGroups.value,
+  })
 }
 
 function onStartNewThread(projectName: string): void {
