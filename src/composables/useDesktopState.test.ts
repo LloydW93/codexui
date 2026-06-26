@@ -801,6 +801,34 @@ describe('startup request deduplication', () => {
 })
 
 describe('live error overlay', () => {
+  it('loads existing thread messages without resuming the thread first', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockRejectedValue(new Error('resume should not be called for plain message loads'))
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [
+        {
+          id: 'user-1',
+          role: 'user',
+          text: 'hello',
+          messageType: 'userMessage',
+        },
+      ],
+      inProgress: false,
+      activeTurnId: '',
+      turnIndexByTurnId: {},
+      hasMoreOlder: false,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('existing-thread')
+    await state.loadMessages('existing-thread')
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('existing-thread')
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    expect(state.messages.value.map((message) => message.text)).toEqual(['hello'])
+  })
+
   it('drops old loaded message payloads outside the recent thread retention window', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])
@@ -1131,7 +1159,7 @@ describe('provider model selection', () => {
       }
       return ['gpt-5.5', 'gpt-5.4-mini']
     })
-    gatewayMocks.resumeThread.mockResolvedValue({
+    gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.4-mini',
       modelProvider: 'opencode_zen',
       messages: [],
@@ -1187,7 +1215,7 @@ describe('provider model selection', () => {
       }
       return ['gpt-5.5', 'gpt-5.4-mini']
     })
-    gatewayMocks.resumeThread.mockResolvedValue({
+    gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.4-mini',
       modelProvider: 'opencode_zen',
       messages: [],
@@ -1372,7 +1400,7 @@ describe('provider model selection', () => {
       speedMode: 'standard',
     })
     gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5', 'gpt-5.4-mini'])
-    gatewayMocks.resumeThread.mockRejectedValue(new Error('thread not found'))
+    gatewayMocks.getThreadDetail.mockRejectedValue(new Error('thread not found'))
 
     const state = useDesktopState()
     state.primeSelectedThread('missing-thread')
@@ -1387,7 +1415,8 @@ describe('provider model selection', () => {
 
     await state.ensureThreadMessagesLoaded('missing-thread', { silent: true })
     await state.loadMessages('missing-thread')
-    expect(gatewayMocks.resumeThread).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
   })
 })
 

@@ -230,6 +230,8 @@ const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 const THREAD_RESPONSE_TURN_LIMIT = 10
 const THREAD_READ_SNAPSHOT_CACHE_LIMIT = 4
 const THREAD_LIVE_STATE_CACHE_LIMIT = 4
+const SESSION_TURN_INDEX_CACHE_LIMIT = 6
+const SESSION_PATH_CACHE_LIMIT = 200
 const STREAM_EVENT_THREAD_BUFFER_LIMIT = 32
 const CAPTURED_ITEM_THREAD_LIMIT = 32
 const CAPTURED_ITEM_PER_THREAD_LIMIT = 200
@@ -471,6 +473,583 @@ async function mergeSessionSkillInputsIntoThreadResult(result: unknown): Promise
     }
   } catch {
     return result
+  }
+}
+
+type DirectSessionTurnOffset = {
+  id: string
+  offset: number
+  startedAt: number
+  completedAt: number | null
+  durationMs: number | null
+}
+
+type DirectSessionMeta = {
+  id: string
+  cwd: string
+  model: string
+  modelProvider: string
+  cliVersion: string
+  source: string
+  createdAt: number
+}
+
+type DirectSessionTurnIndex = {
+  sessionPath: string
+  size: number
+  mtimeMs: number
+  meta: DirectSessionMeta
+  turns: DirectSessionTurnOffset[]
+}
+
+type DirectThreadTurnPage = {
+  result: Record<string, unknown>
+  startTurnIndex: number
+  hasMoreOlder: boolean
+}
+
+type DirectSessionCommandItem = {
+  type: 'commandExecution'
+  id: string
+  command: string
+  cwd: string | null
+  processId: string | null
+  status: 'completed' | 'failed' | 'inProgress'
+  commandActions: unknown[]
+  aggregatedOutput: string | null
+  exitCode: number | null
+  durationMs: number | null
+}
+
+type DirectSessionTurnBuilder = {
+  id: string
+  startedAt: number | null
+  completedAt: number | null
+  durationMs: number | null
+  error: unknown | null
+  items: Record<string, unknown>[]
+  commandByCallId: Map<string, DirectSessionCommandItem>
+}
+
+const sessionPathByThreadIdCache = new Map<string, string>()
+const sessionTurnIndexCache = new Map<string, DirectSessionTurnIndex>()
+const sessionTurnIndexPromiseByPath = new Map<string, Promise<DirectSessionTurnIndex>>()
+
+function unixSecondsFromIso(value: unknown): number {
+  if (typeof value !== 'string' || value.trim().length === 0) return 0
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : 0
+}
+
+function normalizeSessionSource(value: unknown): string {
+  const source = typeof value === 'string' ? value.trim() : ''
+  if (source === 'cli' || source === 'vscode' || source === 'exec' || source === 'appServer' || source === 'unknown') {
+    return source
+  }
+  return 'unknown'
+}
+
+function parseDirectSessionMetaLine(line: string): DirectSessionMeta {
+  try {
+    const row = asRecord(JSON.parse(line) as unknown)
+    const payload = asRecord(row?.payload)
+    return {
+      id: readNonEmptyString(payload?.id),
+      cwd: readNonEmptyString(payload?.cwd),
+      model: '',
+      modelProvider: readNonEmptyString(payload?.model_provider),
+      cliVersion: readNonEmptyString(payload?.cli_version),
+      source: normalizeSessionSource(payload?.source),
+      createdAt: unixSecondsFromIso(payload?.timestamp),
+    }
+  } catch {
+    return {
+      id: '',
+      cwd: '',
+      model: '',
+      modelProvider: '',
+      cliVersion: '',
+      source: 'unknown',
+      createdAt: 0,
+    }
+  }
+}
+
+function parseDirectSessionRow(line: string): Record<string, unknown> | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  try {
+    return asRecord(JSON.parse(trimmed) as unknown)
+  } catch {
+    return null
+  }
+}
+
+function updateDirectSessionTurnCompletion(turns: DirectSessionTurnOffset[], payload: Record<string, unknown>): void {
+  const turnId = readNonEmptyString(payload.turn_id)
+  if (!turnId) return
+  const turn = turns.find((candidate) => candidate.id === turnId)
+  if (!turn) return
+  const completedAt = typeof payload.completed_at === 'number' ? payload.completed_at : null
+  const durationMs = typeof payload.duration_ms === 'number' ? payload.duration_ms : null
+  if (completedAt !== null) turn.completedAt = completedAt
+  if (durationMs !== null) turn.durationMs = durationMs
+}
+
+async function buildDirectSessionTurnIndex(sessionPath: string, fileSize: number, mtimeMs: number): Promise<DirectSessionTurnIndex> {
+  const turns: DirectSessionTurnOffset[] = []
+  let meta: DirectSessionMeta | null = null
+  let carry: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+  let processedBytes = 0
+
+  const processLine = (lineBuffer: Buffer, offset: number): void => {
+    const line = lineBuffer.toString('utf8')
+    if (!meta) {
+      meta = parseDirectSessionMetaLine(line)
+    }
+    if (!line.includes('"type":"task_started"') && !line.includes('"type":"turn_context"') && !line.includes('"type":"task_complete"')) {
+      return
+    }
+    const row = parseDirectSessionRow(line)
+    if (!row) return
+    const payload = asRecord(row.payload)
+    if (!payload) return
+
+    if (row.type === 'event_msg' && payload.type === 'task_started') {
+      const turnId = readNonEmptyString(payload.turn_id)
+      if (!turnId) return
+      const startedAt = typeof payload.started_at === 'number'
+        ? payload.started_at
+        : unixSecondsFromIso(row.timestamp)
+      if (turns[turns.length - 1]?.id !== turnId && !turns.some((turn) => turn.id === turnId)) {
+        turns.push({
+          id: turnId,
+          offset,
+          startedAt,
+          completedAt: null,
+          durationMs: null,
+        })
+      }
+      return
+    }
+
+    if (row.type === 'event_msg' && payload.type === 'task_complete') {
+      updateDirectSessionTurnCompletion(turns, payload)
+      return
+    }
+
+    if (row.type === 'turn_context' && meta) {
+      const model = readNonEmptyString(payload.model)
+      if (model) meta.model = model
+      const cwd = readNonEmptyString(payload.cwd)
+      if (cwd) meta.cwd = cwd
+    }
+  }
+
+  for await (const chunk of createReadStream(sessionPath)) {
+    const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+    const buffer = carry.length > 0 ? Buffer.concat([carry, chunkBuffer]) : chunkBuffer
+    const baseOffset = processedBytes - carry.length
+    let cursor = 0
+    let newline = buffer.indexOf(0x0a, cursor)
+
+    while (newline !== -1) {
+      processLine(buffer.subarray(cursor, newline), baseOffset + cursor)
+      cursor = newline + 1
+      newline = buffer.indexOf(0x0a, cursor)
+    }
+
+    carry = buffer.subarray(cursor)
+    processedBytes += chunkBuffer.length
+  }
+
+  if (carry.length > 0) {
+    processLine(carry, processedBytes - carry.length)
+  }
+
+  return {
+    sessionPath,
+    size: fileSize,
+    mtimeMs,
+    meta: meta ?? {
+      id: '',
+      cwd: '',
+      model: '',
+      modelProvider: '',
+      cliVersion: '',
+      source: 'unknown',
+      createdAt: 0,
+    },
+    turns,
+  }
+}
+
+async function readDirectSessionTurnIndex(sessionPath: string): Promise<DirectSessionTurnIndex> {
+  const sessionStat = await stat(sessionPath)
+  const cached = getAndTouchMapEntry(sessionTurnIndexCache, sessionPath)
+  if (cached && cached.size === sessionStat.size && cached.mtimeMs === sessionStat.mtimeMs) {
+    return cached
+  }
+
+  const pending = sessionTurnIndexPromiseByPath.get(sessionPath)
+  if (pending) return pending
+
+  const promise = buildDirectSessionTurnIndex(sessionPath, sessionStat.size, sessionStat.mtimeMs)
+    .then((index) => {
+      setBoundedMapEntry(sessionTurnIndexCache, sessionPath, index, SESSION_TURN_INDEX_CACHE_LIMIT)
+      return index
+    })
+    .finally(() => {
+      sessionTurnIndexPromiseByPath.delete(sessionPath)
+    })
+  sessionTurnIndexPromiseByPath.set(sessionPath, promise)
+  return promise
+}
+
+async function findDirectSessionPathForThread(threadId: string): Promise<string> {
+  const cached = getAndTouchMapEntry(sessionPathByThreadIdCache, threadId)
+  if (cached) {
+    try {
+      await stat(cached)
+      return cached
+    } catch {
+      sessionPathByThreadIdCache.delete(threadId)
+    }
+  }
+
+  const roots = [
+    join(getCodexHomeDir(), 'sessions'),
+    join(getCodexHomeDir(), 'archived_sessions'),
+  ]
+  for (const root of roots) {
+    for await (const sessionPath of walkFiles(root)) {
+      if (extname(sessionPath) !== '.jsonl') continue
+      if (!basename(sessionPath).includes(threadId)) continue
+      setBoundedMapEntry(sessionPathByThreadIdCache, threadId, sessionPath, SESSION_PATH_CACHE_LIMIT)
+      return sessionPath
+    }
+  }
+
+  return ''
+}
+
+async function readFileRangeUtf8(filePath: string, start: number, endExclusive: number): Promise<string> {
+  if (endExclusive <= start) return ''
+  const chunks: Buffer[] = []
+  for await (const chunk of createReadStream(filePath, { start, end: endExclusive - 1 })) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+function getDirectTurnBuilder(
+  builders: Map<string, DirectSessionTurnBuilder>,
+  turnId: string,
+): DirectSessionTurnBuilder | null {
+  if (!turnId) return null
+  return builders.get(turnId) ?? null
+}
+
+function toDirectUserContentBlocks(content: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(content)) return []
+  const blocks: Record<string, unknown>[] = []
+  for (const item of content) {
+    const record = asRecord(item)
+    if (!record) continue
+    if (record.type === 'input_text' && typeof record.text === 'string') {
+      blocks.push({ type: 'text', text: record.text, text_elements: [] })
+      const skill = parseSessionSkillText(record.text)
+      if (skill) blocks.push({ type: 'skill', name: skill.name, path: skill.path })
+      continue
+    }
+    if (record.type === 'input_image') {
+      const imageUrl = readNonEmptyString(record.image_url) || readNonEmptyString(record.url)
+      if (imageUrl) blocks.push({ type: 'image', url: imageUrl })
+      continue
+    }
+    if (record.type === 'local_image') {
+      const path = readNonEmptyString(record.path)
+      if (path) blocks.push({ type: 'localImage', path })
+    }
+  }
+  return blocks
+}
+
+function readDirectAssistantText(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  return content.flatMap((item) => {
+    const record = asRecord(item)
+    if (!record || record.type !== 'output_text' || typeof record.text !== 'string') return []
+    return [record.text]
+  }).join('\n')
+}
+
+function appendDirectMessageItem(builder: DirectSessionTurnBuilder, payload: Record<string, unknown>): void {
+  const role = readNonEmptyString(payload.role)
+  const itemId = `session-${builder.id}-item-${builder.items.length + 1}`
+  if (role === 'user') {
+    const content = toDirectUserContentBlocks(payload.content)
+    if (content.length === 0) return
+    builder.items.push({
+      type: 'userMessage',
+      id: itemId,
+      clientId: null,
+      content,
+    })
+    return
+  }
+
+  if (role === 'assistant') {
+    const text = readDirectAssistantText(payload.content)
+    if (!text) return
+    builder.items.push({
+      type: payload.phase === 'plan' ? 'plan' : 'agentMessage',
+      id: itemId,
+      text,
+      phase: readNonEmptyString(payload.phase) || null,
+      memoryCitation: payload.memory_citation ?? null,
+    })
+  }
+}
+
+function appendDirectCommandItem(builder: DirectSessionTurnBuilder, payload: Record<string, unknown>): void {
+  const callId = readNonEmptyString(payload.call_id)
+  if (!callId) return
+
+  let args: Record<string, unknown> | null = null
+  try {
+    args = asRecord(JSON.parse(typeof payload.arguments === 'string' ? payload.arguments : '{}') as unknown)
+  } catch {
+    args = null
+  }
+
+  const command = readNonEmptyString(args?.cmd) || readNonEmptyString(args?.command)
+  if (!command) return
+  const item: DirectSessionCommandItem = {
+    type: 'commandExecution',
+    id: callId,
+    command,
+    cwd: readNonEmptyString(args?.workdir) || readNonEmptyString(args?.cwd) || null,
+    processId: null,
+    status: 'inProgress',
+    commandActions: [],
+    aggregatedOutput: null,
+    exitCode: null,
+    durationMs: null,
+  }
+  builder.commandByCallId.set(callId, item)
+  builder.items.push(item as unknown as Record<string, unknown>)
+}
+
+function completeDirectCommandItem(builder: DirectSessionTurnBuilder, payload: Record<string, unknown>): void {
+  const callId = readNonEmptyString(payload.call_id)
+  if (!callId) return
+  const item = builder.commandByCallId.get(callId)
+  if (!item) return
+
+  const parsed = parseExecCommandOutput(typeof payload.output === 'string' ? payload.output : '')
+  item.aggregatedOutput = parsed.cleanOutput
+  item.exitCode = parsed.exitCode
+  item.durationMs = parsed.wallTime
+  item.status = parsed.exitCode === 0 || parsed.exitCode === null ? 'completed' : 'failed'
+}
+
+function appendDirectApplyPatchItem(builder: DirectSessionTurnBuilder, payload: Record<string, unknown>): void {
+  if (payload.name !== 'apply_patch' || payload.status !== 'completed') return
+  const callId = readNonEmptyString(payload.call_id)
+  const input = readNonEmptyString(payload.input)
+  if (!callId || !input) return
+
+  const parsedChanges = parseApplyPatchInput(input)
+  if (parsedChanges.length === 0) return
+  builder.items.push({
+    type: 'fileChange',
+    id: callId,
+    status: 'completed',
+    changes: parsedChanges.map((change) => ({
+      ...change,
+      kind: { type: change.operation, ...(change.movedToPath ? { move_path: change.movedToPath } : {}) },
+    })),
+  })
+}
+
+function applyDirectSessionResponseItem(builder: DirectSessionTurnBuilder, payload: Record<string, unknown>): void {
+  if (payload.type === 'message') {
+    appendDirectMessageItem(builder, payload)
+    return
+  }
+  if (payload.type === 'function_call' && payload.name === 'exec_command') {
+    appendDirectCommandItem(builder, payload)
+    return
+  }
+  if (payload.type === 'function_call_output') {
+    completeDirectCommandItem(builder, payload)
+    return
+  }
+  if (payload.type === 'custom_tool_call') {
+    appendDirectApplyPatchItem(builder, payload)
+  }
+}
+
+function parseDirectSessionTurns(
+  sessionLogRaw: string,
+  selectedTurns: DirectSessionTurnOffset[],
+): Record<string, unknown>[] {
+  const selectedTurnIds = new Set(selectedTurns.map((turn) => turn.id))
+  const builders = new Map<string, DirectSessionTurnBuilder>()
+  for (const turn of selectedTurns) {
+    builders.set(turn.id, {
+      id: turn.id,
+      startedAt: turn.startedAt,
+      completedAt: turn.completedAt,
+      durationMs: turn.durationMs,
+      error: null,
+      items: [],
+      commandByCallId: new Map(),
+    })
+  }
+
+  let currentTurnId = ''
+  for (const line of sessionLogRaw.split('\n')) {
+    const row = parseDirectSessionRow(line)
+    if (!row) continue
+    const payload = asRecord(row.payload)
+    if (!payload) continue
+
+    if (row.type === 'event_msg' && payload.type === 'task_started') {
+      const nextTurnId = readNonEmptyString(payload.turn_id)
+      currentTurnId = nextTurnId || currentTurnId
+      const builder = getDirectTurnBuilder(builders, currentTurnId)
+      if (builder && typeof payload.started_at === 'number') {
+        builder.startedAt = payload.started_at
+      }
+      continue
+    }
+
+    if (row.type === 'turn_context') {
+      const nextTurnId = readNonEmptyString(payload.turn_id)
+      currentTurnId = nextTurnId || currentTurnId
+      continue
+    }
+
+    if (row.type === 'event_msg' && payload.type === 'task_complete') {
+      const turnId = readNonEmptyString(payload.turn_id)
+      const builder = getDirectTurnBuilder(builders, turnId)
+      if (builder) {
+        builder.completedAt = typeof payload.completed_at === 'number' ? payload.completed_at : builder.completedAt
+        builder.durationMs = typeof payload.duration_ms === 'number' ? payload.duration_ms : builder.durationMs
+      }
+      continue
+    }
+
+    if (row.type !== 'response_item' || !selectedTurnIds.has(currentTurnId)) continue
+    const builder = getDirectTurnBuilder(builders, currentTurnId)
+    if (!builder) continue
+    applyDirectSessionResponseItem(builder, payload)
+  }
+
+  return selectedTurns.map((turn) => {
+    const builder = builders.get(turn.id)
+    const completedAt = builder?.completedAt ?? turn.completedAt
+    const startedAt = builder?.startedAt ?? turn.startedAt
+    return {
+      id: turn.id,
+      items: builder?.items ?? [],
+      itemsView: 'full',
+      status: completedAt === null ? 'inProgress' : 'completed',
+      error: builder?.error ?? null,
+      startedAt,
+      completedAt,
+      durationMs: builder?.durationMs ?? turn.durationMs,
+    }
+  })
+}
+
+function readDirectThreadPreview(turns: Record<string, unknown>[]): string {
+  for (const turn of turns) {
+    const items = Array.isArray(turn.items) ? turn.items : []
+    for (const item of items) {
+      const itemRecord = asRecord(item)
+      if (itemRecord?.type !== 'userMessage' || !Array.isArray(itemRecord.content)) continue
+      for (const contentItem of itemRecord.content) {
+        const contentRecord = asRecord(contentItem)
+        if (contentRecord?.type === 'text' && typeof contentRecord.text === 'string' && contentRecord.text.trim()) {
+          return contentRecord.text.trim()
+        }
+      }
+    }
+  }
+  return ''
+}
+
+export async function readDirectSessionThreadTurnPage(
+  threadId: string,
+  beforeTurnId: string,
+  limit: number,
+): Promise<DirectThreadTurnPage | null> {
+  const sessionPath = await findDirectSessionPathForThread(threadId)
+  if (!sessionPath) return null
+
+  const index = await readDirectSessionTurnIndex(sessionPath)
+  if (index.turns.length === 0) return null
+
+  const endIndex = beforeTurnId
+    ? index.turns.findIndex((turn) => turn.id === beforeTurnId)
+    : index.turns.length
+  if (beforeTurnId && endIndex < 0) {
+    return {
+      result: {
+        thread: {
+          id: threadId,
+          sessionId: threadId,
+          path: sessionPath,
+          cwd: index.meta.cwd,
+          modelProvider: index.meta.modelProvider,
+          turns: [],
+        },
+      },
+      startTurnIndex: 0,
+      hasMoreOlder: false,
+    }
+  }
+
+  const pageEndIndex = Math.max(0, endIndex)
+  const startTurnIndex = Math.max(0, pageEndIndex - limit)
+  const selectedTurns = index.turns.slice(startTurnIndex, pageEndIndex)
+  const rangeStart = selectedTurns[0]?.offset ?? 0
+  const rangeEnd = index.turns[pageEndIndex]?.offset ?? index.size
+  const raw = await readFileRangeUtf8(sessionPath, rangeStart, rangeEnd)
+  const turns = parseDirectSessionTurns(raw, selectedTurns)
+  const titles = await readMergedThreadTitleCache().catch(() => EMPTY_THREAD_TITLE_CACHE)
+  const preview = readDirectThreadPreview(turns)
+  const createdAt = index.meta.createdAt || index.turns[0]?.startedAt || 0
+  const updatedAt = selectedTurns.at(-1)?.completedAt ?? selectedTurns.at(-1)?.startedAt ?? createdAt
+  const isInProgress = asRecord(turns.at(-1))?.status === 'inProgress'
+
+  return {
+    result: {
+      model: index.meta.model,
+      modelProvider: index.meta.modelProvider,
+      cwd: index.meta.cwd,
+      thread: {
+        id: threadId,
+        sessionId: threadId,
+        name: readNonEmptyString(titles.titles[threadId]) || preview || 'Untitled thread',
+        preview,
+        modelProvider: index.meta.modelProvider,
+        createdAt,
+        updatedAt,
+        path: sessionPath,
+        cwd: index.meta.cwd,
+        cliVersion: index.meta.cliVersion,
+        source: index.meta.source,
+        gitInfo: null,
+        status: isInProgress ? { type: 'active', activeFlags: [] } : { type: 'idle' },
+        turns,
+      },
+    },
+    startTurnIndex,
+    hasMoreOlder: startTurnIndex > 0,
   }
 }
 
@@ -7991,6 +8570,18 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             return
           }
 
+          const directPage = await readDirectSessionThreadTurnPage(threadId, beforeTurnId, limit)
+          if (directPage) {
+            const streamMerged = mergeStreamTurnErrorsIntoThreadResult(appServer, directPage.result)
+            const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', streamMerged)
+            setJson(res, 200, {
+              result: sanitized,
+              startTurnIndex: directPage.startTurnIndex,
+              hasMoreOlder: directPage.hasMoreOlder,
+            })
+            return
+          }
+
           const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.readThreadForTurnPage(threadId))
           const record = asRecord(threadReadResult)
           const thread = asRecord(record?.thread)
@@ -8102,6 +8693,28 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
 
         try {
+          const directPage = await readDirectSessionThreadTurnPage(threadId, '', THREAD_RESPONSE_TURN_LIMIT)
+          if (directPage) {
+            const streamMerged = mergeStreamTurnErrorsIntoThreadResult(appServer, directPage.result)
+            const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', streamMerged)
+            const record = asRecord(sanitized)
+            const thread = asRecord(record?.thread)
+            const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
+            const turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
+            const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
+            const isInProgress = lastTurn?.status === 'inProgress'
+            setJson(res, 200, {
+              threadId,
+              conversationState: {
+                turns,
+              },
+              ownerClientId: null,
+              liveStateError: null,
+              isInProgress,
+            })
+            return
+          }
+
           const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.rpc('thread/read', {
             threadId,
             includeTurns: true,

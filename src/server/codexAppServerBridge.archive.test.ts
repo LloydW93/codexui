@@ -15,6 +15,7 @@ import {
   isThreadNotFoundError,
   isUnauthenticatedRateLimitError,
   loadThreadSummariesForSearch,
+  readDirectSessionThreadTurnPage,
   writeFreeModeStateFile,
   writeWorkspaceRootsState,
 } from './codexAppServerBridge'
@@ -423,6 +424,129 @@ describe('loadThreadSummariesForSearch', () => {
       { method: 'thread/list', params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: 'cursor-3' } },
       { method: 'thread/list', params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: 'cursor-4' } },
     ])
+  })
+})
+
+describe('readDirectSessionThreadTurnPage', () => {
+  it('loads a bounded turn page directly from the session jsonl', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codexui-direct-thread-page-'))
+    const threadId = 'direct-thread'
+    const sessionDir = join(codexHome, 'sessions', '2026', '06', '26')
+    const sessionPath = join(sessionDir, `rollout-2026-06-26T12-00-00-${threadId}.jsonl`)
+    await mkdir(sessionDir, { recursive: true })
+    process.env.CODEX_HOME = codexHome
+
+    const lines: string[] = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: threadId,
+          timestamp: '2026-06-26T12:00:00.000Z',
+          cwd: '/workspace/project',
+          cli_version: '0.1.0',
+          source: 'vscode',
+          model_provider: 'proxy',
+        },
+      }),
+    ]
+    for (let index = 1; index <= 12; index += 1) {
+      const turnId = `turn-${String(index).padStart(2, '0')}`
+      lines.push(JSON.stringify({
+        timestamp: `2026-06-26T12:${String(index).padStart(2, '0')}:00.000Z`,
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: turnId, started_at: 1782475200 + index },
+      }))
+      lines.push(JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: turnId, cwd: '/workspace/project', model: 'gpt-5.5' },
+      }))
+      lines.push(JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: `user ${index}` }],
+        },
+      }))
+      lines.push(JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: `assistant ${index}` }],
+          phase: 'final_answer',
+        },
+      }))
+      if (index === 12) {
+        lines.push(JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            call_id: 'call_direct',
+            arguments: JSON.stringify({ cmd: 'git status --short', workdir: '/workspace/project' }),
+          },
+        }))
+        lines.push(JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_direct',
+            output: 'Process exited with code 0\nWall time: 0.1 seconds\nOutput:\nclean\n',
+          },
+        }))
+      }
+      lines.push(JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: turnId,
+          completed_at: 1782475201 + index,
+          duration_ms: 1000,
+        },
+      }))
+    }
+    await writeFile(sessionPath, `${lines.join('\n')}\n`, 'utf8')
+    await writeFile(
+      join(codexHome, 'session_index.jsonl'),
+      `${JSON.stringify({ id: threadId, thread_name: 'Direct Thread', updated_at: '2026-06-26T12:12:00.000Z' })}\n`,
+      'utf8',
+    )
+
+    try {
+      const page = await readDirectSessionThreadTurnPage(threadId, '', 10)
+      expect(page?.startTurnIndex).toBe(2)
+      expect(page?.hasMoreOlder).toBe(true)
+      const result = page?.result as { model?: string; modelProvider?: string; thread?: { name?: string; turns?: Array<{ id: string; items: unknown[] }> } }
+      expect(result.model).toBe('gpt-5.5')
+      expect(result.modelProvider).toBe('proxy')
+      expect(result.thread?.name).toBe('Direct Thread')
+      expect(result.thread?.turns?.map((turn) => turn.id)).toEqual([
+        'turn-03',
+        'turn-04',
+        'turn-05',
+        'turn-06',
+        'turn-07',
+        'turn-08',
+        'turn-09',
+        'turn-10',
+        'turn-11',
+        'turn-12',
+      ])
+      expect(result.thread?.turns?.at(-1)?.items.map((item) => (item as { type?: string }).type)).toEqual([
+        'userMessage',
+        'agentMessage',
+        'commandExecution',
+      ])
+
+      const olderPage = await readDirectSessionThreadTurnPage(threadId, 'turn-03', 10)
+      expect(olderPage?.startTurnIndex).toBe(0)
+      expect(olderPage?.hasMoreOlder).toBe(false)
+      const olderResult = olderPage?.result as { thread?: { turns?: Array<{ id: string }> } }
+      expect(olderResult.thread?.turns?.map((turn) => turn.id)).toEqual(['turn-01', 'turn-02'])
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
   })
 })
 
