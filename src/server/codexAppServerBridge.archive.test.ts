@@ -548,6 +548,86 @@ describe('readDirectSessionThreadTurnPage', () => {
       await rm(codexHome, { recursive: true, force: true })
     }
   })
+
+  it('does not expose unfinished direct session turns as active without live stream evidence', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codexui-direct-thread-orphan-'))
+    const threadId = 'direct-orphan-thread'
+    const sessionDir = join(codexHome, 'sessions', '2026', '06', '26')
+    const sessionPath = join(sessionDir, `rollout-2026-06-26T13-00-00-${threadId}.jsonl`)
+    await mkdir(sessionDir, { recursive: true })
+    process.env.CODEX_HOME = codexHome
+
+    const lines = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: threadId,
+          timestamp: '2026-06-26T13:00:00.000Z',
+          cwd: '/workspace/project',
+          cli_version: '0.1.0',
+          source: 'vscode',
+          model_provider: 'proxy',
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-06-26T13:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-open', started_at: 1782478801 },
+      }),
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 'turn-open', cwd: '/workspace/project', model: 'gpt-5.5' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'still running before restart' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          call_id: 'call_open',
+          arguments: JSON.stringify({ cmd: 'sleep 100', workdir: '/workspace/project' }),
+        },
+      }),
+    ]
+    await writeFile(sessionPath, `${lines.join('\n')}\n`, 'utf8')
+
+    try {
+      const page = await readDirectSessionThreadTurnPage(threadId, '', 10)
+      const result = page?.result as {
+        thread?: {
+          status?: { type?: string }
+          turns?: Array<{ id: string; status?: string; items: Array<{ type?: string; status?: string }> }>
+        }
+      }
+      const turn = result.thread?.turns?.[0]
+      const command = turn?.items.find((item) => item.type === 'commandExecution')
+      expect(result.thread?.status).toEqual({ type: 'idle' })
+      expect(turn?.status).toBe('interrupted')
+      expect(command?.status).toBe('interrupted')
+
+      const livePage = await readDirectSessionThreadTurnPage(threadId, '', 10, { activeTurnIds: new Set(['turn-open']) })
+      const liveResult = livePage?.result as {
+        thread?: {
+          status?: { type?: string; activeFlags?: unknown[] }
+          turns?: Array<{ id: string; status?: string; items: Array<{ type?: string; status?: string }> }>
+        }
+      }
+      const liveTurn = liveResult.thread?.turns?.[0]
+      const liveCommand = liveTurn?.items.find((item) => item.type === 'commandExecution')
+      expect(liveResult.thread?.status).toEqual({ type: 'active', activeFlags: [] })
+      expect(liveTurn?.status).toBe('inProgress')
+      expect(liveCommand?.status).toBe('inProgress')
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('isThreadNotFoundError', () => {

@@ -508,13 +508,17 @@ type DirectThreadTurnPage = {
   hasMoreOlder: boolean
 }
 
+type DirectThreadTurnPageOptions = {
+  activeTurnIds?: ReadonlySet<string>
+}
+
 type DirectSessionCommandItem = {
   type: 'commandExecution'
   id: string
   command: string
   cwd: string | null
   processId: string | null
-  status: 'completed' | 'failed' | 'inProgress'
+  status: 'completed' | 'failed' | 'inProgress' | 'interrupted'
   commandActions: unknown[]
   aggregatedOutput: string | null
   exitCode: number | null
@@ -891,9 +895,26 @@ function applyDirectSessionResponseItem(builder: DirectSessionTurnBuilder, paylo
   }
 }
 
+function markOrphanedDirectSessionItems(items: Record<string, unknown>[]): Record<string, unknown>[] {
+  let changed = false
+  const nextItems = items.map((item) => {
+    const itemRecord = asRecord(item)
+    if (itemRecord?.type !== 'commandExecution' || itemRecord.status !== 'inProgress') return item
+    changed = true
+    return {
+      ...itemRecord,
+      status: 'interrupted',
+      aggregatedOutput: typeof itemRecord.aggregatedOutput === 'string' ? itemRecord.aggregatedOutput : '',
+      exitCode: null,
+    }
+  })
+  return changed ? nextItems : items
+}
+
 function parseDirectSessionTurns(
   sessionLogRaw: string,
   selectedTurns: DirectSessionTurnOffset[],
+  options: DirectThreadTurnPageOptions = {},
 ): Record<string, unknown>[] {
   const selectedTurnIds = new Set(selectedTurns.map((turn) => turn.id))
   const builders = new Map<string, DirectSessionTurnBuilder>()
@@ -952,11 +973,14 @@ function parseDirectSessionTurns(
     const builder = builders.get(turn.id)
     const completedAt = builder?.completedAt ?? turn.completedAt
     const startedAt = builder?.startedAt ?? turn.startedAt
+    const isOpen = completedAt === null
+    const isLiveOpenTurn = isOpen && options.activeTurnIds?.has(turn.id) === true
+    const items = builder?.items ?? []
     return {
       id: turn.id,
-      items: builder?.items ?? [],
+      items: isOpen && !isLiveOpenTurn ? markOrphanedDirectSessionItems(items) : items,
       itemsView: 'full',
-      status: completedAt === null ? 'inProgress' : 'completed',
+      status: isOpen ? (isLiveOpenTurn ? 'inProgress' : 'interrupted') : 'completed',
       error: builder?.error ?? null,
       startedAt,
       completedAt,
@@ -986,6 +1010,7 @@ export async function readDirectSessionThreadTurnPage(
   threadId: string,
   beforeTurnId: string,
   limit: number,
+  options: DirectThreadTurnPageOptions = {},
 ): Promise<DirectThreadTurnPage | null> {
   const sessionPath = await findDirectSessionPathForThread(threadId)
   if (!sessionPath) return null
@@ -1019,7 +1044,7 @@ export async function readDirectSessionThreadTurnPage(
   const rangeStart = selectedTurns[0]?.offset ?? 0
   const rangeEnd = index.turns[pageEndIndex]?.offset ?? index.size
   const raw = await readFileRangeUtf8(sessionPath, rangeStart, rangeEnd)
-  const turns = parseDirectSessionTurns(raw, selectedTurns)
+  const turns = parseDirectSessionTurns(raw, selectedTurns, options)
   const titles = await readMergedThreadTitleCache().catch(() => EMPTY_THREAD_TITLE_CACHE)
   const preview = readDirectThreadPreview(turns)
   const createdAt = index.meta.createdAt || index.turns[0]?.startedAt || 0
@@ -1581,6 +1606,31 @@ function readStreamTurnId(params: Record<string, unknown>): string {
   if (directTurnId) return directTurnId
   const turn = asRecord(params.turn)
   return readNonEmptyString(turn?.id)
+}
+
+function isStreamFrameActiveTurnEvidence(method: string): boolean {
+  if (method === 'turn/started') return true
+  if (method === 'item/started') return true
+  if (method.startsWith('item/') && method !== 'item/completed') return true
+  return false
+}
+
+function readActiveTurnIdsFromStreamEvents(frames: StreamEventFrame[]): Set<string> {
+  const activeTurnIds = new Set<string>()
+  for (const frame of frames) {
+    const params = asRecord(frame.params)
+    if (!params) continue
+    const turnId = readStreamTurnId(params)
+    if (!turnId) continue
+    if (frame.method === 'turn/completed') {
+      activeTurnIds.delete(turnId)
+      continue
+    }
+    if (isStreamFrameActiveTurnEvidence(frame.method)) {
+      activeTurnIds.add(turnId)
+    }
+  }
+  return activeTurnIds
 }
 
 function readStreamTurnErrorMessage(frame: StreamEventFrame): { turnId: string; message: string } | null {
@@ -8570,7 +8620,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             return
           }
 
-          const directPage = await readDirectSessionThreadTurnPage(threadId, beforeTurnId, limit)
+          const activeTurnIds = readActiveTurnIdsFromStreamEvents(appServer.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT))
+          const directPage = await readDirectSessionThreadTurnPage(threadId, beforeTurnId, limit, { activeTurnIds })
           if (directPage) {
             const streamMerged = mergeStreamTurnErrorsIntoThreadResult(appServer, directPage.result)
             const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', streamMerged)
@@ -8693,7 +8744,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
 
         try {
-          const directPage = await readDirectSessionThreadTurnPage(threadId, '', THREAD_RESPONSE_TURN_LIMIT)
+          const activeTurnIds = readActiveTurnIdsFromStreamEvents(appServer.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT))
+          const directPage = await readDirectSessionThreadTurnPage(threadId, '', THREAD_RESPONSE_TURN_LIMIT, { activeTurnIds })
           if (directPage) {
             const streamMerged = mergeStreamTurnErrorsIntoThreadResult(appServer, directPage.result)
             const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', streamMerged)
