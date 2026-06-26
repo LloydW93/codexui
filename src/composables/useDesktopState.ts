@@ -528,7 +528,8 @@ function loadProjectDisplayNames(): Record<string, string> {
     for (const [projectName, displayName] of Object.entries(parsed as Record<string, unknown>)) {
       const normalizedProjectName = typeof projectName === 'string' ? toProjectName(projectName) : ''
       if (normalizedProjectName.length > 0 && typeof displayName === 'string') {
-        displayNames[normalizedProjectName] = displayName
+        const normalizedDisplayName = normalizeStoredProjectDisplayName(normalizedProjectName, displayName)
+        if (normalizedDisplayName) displayNames[normalizedProjectName] = normalizedDisplayName
       }
     }
     return displayNames
@@ -540,6 +541,24 @@ function loadProjectDisplayNames(): Record<string, string> {
 function saveProjectDisplayNames(displayNames: Record<string, string>): void {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(PROJECT_DISPLAY_NAME_STORAGE_KEY, JSON.stringify(displayNames))
+}
+
+function isManagedWorktreeDisplayAlias(projectName: string, displayName: string): boolean {
+  const normalizedProjectName = toProjectName(projectName)
+  const normalizedDisplayName = normalizePathForUi(displayName).trim()
+  return Boolean(
+    normalizedProjectName
+    && normalizedDisplayName
+    && isLegacyManagedWorktreeRootPath(normalizedDisplayName)
+    && toProjectName(normalizedDisplayName) === normalizedProjectName,
+  )
+}
+
+function normalizeStoredProjectDisplayName(projectName: string, displayName: string): string {
+  const trimmedDisplayName = displayName.trim()
+  if (!trimmedDisplayName) return ''
+  if (isManagedWorktreeDisplayAlias(projectName, trimmedDisplayName)) return ''
+  return trimmedDisplayName
 }
 
 function mergeProjectOrder(previousOrder: string[], incomingGroups: UiProjectGroup[]): string[] {
@@ -4217,8 +4236,15 @@ export function useDesktopState() {
           const projectNames = [toProjectNameFromWorkspaceRoot(rootPath)]
           if (normalizedRootPath) projectNames.push(normalizedRootPath)
           for (const projectName of projectNames) {
-            if (nextLabels[projectName] === label) continue
-            nextLabels[projectName] = label
+            const normalizedLabel = normalizeStoredProjectDisplayName(projectName, label)
+            if (!normalizedLabel) {
+              if (nextLabels[projectName] === undefined) continue
+              delete nextLabels[projectName]
+              changed = true
+              continue
+            }
+            if (nextLabels[projectName] === normalizedLabel) continue
+            nextLabels[projectName] = normalizedLabel
             changed = true
           }
         }

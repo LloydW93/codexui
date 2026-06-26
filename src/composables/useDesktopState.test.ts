@@ -381,6 +381,24 @@ describe('filterGroupsByWorkspaceRoots', () => {
   })
 })
 
+describe('project display names', () => {
+  it('ignores stale Codex worktree paths saved as canonical project display names', () => {
+    installTestWindow({
+      'codex-web-local.project-display-name.v1': JSON.stringify({
+        'rollups-monitor': '/home/lloyd/.codex/worktrees/8aab/rollups-monitor',
+        '/home/lloyd/.codex/worktrees/bbca/rollups-monitor': '/home/lloyd/.codex/worktrees/bbca/rollups-monitor',
+        buildbarn: 'Buildbarn',
+      }),
+    })
+
+    const state = useDesktopState()
+
+    expect(state.projectDisplayNameById.value).toEqual({
+      buildbarn: 'Buildbarn',
+    })
+  })
+})
+
 describe('removeThreadFromGroups', () => {
   it('removes an archived thread and drops the now-empty project group', () => {
     const groups: UiProjectGroup[] = [
