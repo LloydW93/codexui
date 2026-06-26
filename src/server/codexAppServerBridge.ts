@@ -788,6 +788,12 @@ function readDirectAssistantText(content: unknown): string {
   }).join('\n')
 }
 
+const DIRECT_MEMORY_CITATION_FOOTER = /(?:\r?\n){0,2}\s*<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>\s*$/u
+
+function stripDirectMemoryCitationFooter(value: string): string {
+  return value.replace(DIRECT_MEMORY_CITATION_FOOTER, '').trimEnd()
+}
+
 function appendDirectMessageItem(builder: DirectSessionTurnBuilder, payload: Record<string, unknown>): void {
   const role = readNonEmptyString(payload.role)
   const itemId = `session-${builder.id}-item-${builder.items.length + 1}`
@@ -804,7 +810,7 @@ function appendDirectMessageItem(builder: DirectSessionTurnBuilder, payload: Rec
   }
 
   if (role === 'assistant') {
-    const text = readDirectAssistantText(payload.content)
+    const text = stripDirectMemoryCitationFooter(readDirectAssistantText(payload.content))
     if (!text) return
     builder.items.push({
       type: payload.phase === 'plan' ? 'plan' : 'agentMessage',

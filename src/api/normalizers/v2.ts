@@ -39,6 +39,11 @@ function readTurnErrorText(turn: Turn): string {
 const FILE_ATTACHMENT_LINE = /^##\s+(.+?):\s+(.+?)\s*$/
 const FILES_MENTIONED_MARKER = /^#\s*files mentioned by the user\s*:?\s*$/i
 const ASSISTANT_FILE_CHANGE_HEADING = /^(?:#{1,6}\s*)?(?:本次修改文件(?:和操作)?(?:如下)?|修改文件和操作)\s*[:：]?\s*$/u
+const MEMORY_CITATION_FOOTER = /(?:\r?\n){0,2}\s*<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>\s*$/u
+
+function stripMemoryCitationFooter(value: string): string {
+  return value.replace(MEMORY_CITATION_FOOTER, '').trimEnd()
+}
 
 function extractFileAttachments(value: string): UiFileAttachment[] {
   const markerIdx = value.split('\n').findIndex((line) => FILES_MENTIONED_MARKER.test(line.trim()))
@@ -405,7 +410,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       {
         id: item.id,
         role: 'assistant',
-        text: item.text,
+        text: stripMemoryCitationFooter(item.text),
         messageType: item.type,
       },
     ]
@@ -475,7 +480,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
 
 
   if (item.type === 'plan') {
-    const text = typeof item.text === 'string' ? item.text : ''
+    const text = typeof item.text === 'string' ? stripMemoryCitationFooter(item.text) : ''
     return [
       {
         id: item.id,

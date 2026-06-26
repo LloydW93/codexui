@@ -473,7 +473,21 @@ describe('readDirectSessionThreadTurnPage', () => {
         payload: {
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: `assistant ${index}` }],
+          content: [{
+            type: 'output_text',
+            text: index === 12
+              ? `assistant ${index}
+
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:137-145|note=[phase b account incident workflow context]
+</citation_entries>
+<rollout_ids>
+019ef00e-ac21-7b40-8363-e84213ba3e3f
+</rollout_ids>
+</oai-mem-citation>`
+              : `assistant ${index}`,
+          }],
           phase: 'final_answer',
         },
       }))
@@ -538,6 +552,8 @@ describe('readDirectSessionThreadTurnPage', () => {
         'agentMessage',
         'commandExecution',
       ])
+      const agentItem = result.thread?.turns?.at(-1)?.items.find((item) => (item as { type?: string }).type === 'agentMessage') as { text?: string } | undefined
+      expect(agentItem?.text).toBe('assistant 12')
 
       const olderPage = await readDirectSessionThreadTurnPage(threadId, 'turn-03', 10)
       expect(olderPage?.startTurnIndex).toBe(0)

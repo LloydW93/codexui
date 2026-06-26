@@ -26,6 +26,31 @@ function threadReadResponseWithContent(content: ThreadReadResponse['thread']['tu
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it('strips hidden memory citation footers from assistant text', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'agentMessage',
+      id: 'agent-1',
+      text: `Answer body.
+
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:137-145|note=[phase b account incident workflow context]
+</citation_entries>
+<rollout_ids>
+019ef00e-ac21-7b40-8363-e84213ba3e3f
+</rollout_ids>
+</oai-mem-citation>`,
+    }]))
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({
+      id: 'agent-1',
+      role: 'assistant',
+      text: 'Answer body.',
+      messageType: 'agentMessage',
+    })
+  })
+
   it('preserves selected skill inputs on the rendered user message', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',
