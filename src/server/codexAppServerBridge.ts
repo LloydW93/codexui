@@ -314,6 +314,53 @@ function parseSessionSkillText(value: string): SessionRecoveredSkillInput | null
   return { name, path }
 }
 
+const SESSION_INTERNAL_MESSAGE_TAGS = new Set([
+  'collaboration_mode',
+  'environment_context',
+  'model_switch',
+  'oai-mem-citation',
+  'permissions_instructions',
+  'personality_spec',
+  'plugins_instructions',
+  'skills_instructions',
+  'subagent_notification',
+  'turn_aborted',
+])
+
+function readSessionEnvelopeTag(value: string): string {
+  const trimmed = value.trim()
+  const match = /^<([A-Za-z][A-Za-z0-9_-]*)(?:\s[^>]*)?>[\s\S]*<\/\1>\s*$/u.exec(trimmed)
+    ?? /^<([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)*)>[\s\S]*<\/\1>\s*$/u.exec(trimmed)
+  return match?.[1]?.trim().toLowerCase().replace(/\s+/gu, '_') ?? ''
+}
+
+function isSessionInternalInputText(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  const tag = readSessionEnvelopeTag(trimmed)
+  if (tag && SESSION_INTERNAL_MESSAGE_TAGS.has(tag)) return true
+  if (/^#{1,6}\s+AGENTS\.md instructions for\b/iu.test(trimmed) && trimmed.includes('<INSTRUCTIONS>')) return true
+  return trimmed.startsWith('Another language model started to solve this problem')
+    && trimmed.includes('Use this to build on the work that has already been done')
+}
+
+function isSessionUserTextBlockType(value: unknown): boolean {
+  return value === 'input_text' || value === 'text'
+}
+
+function readVisibleSessionUserTextFromContent(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  for (const item of content) {
+    const record = asRecord(item)
+    if (!record || !isSessionUserTextBlockType(record.type) || typeof record.text !== 'string') continue
+    if (isSessionInternalInputText(record.text)) continue
+    if (parseSessionSkillText(record.text)) continue
+    const text = record.text.trim()
+    if (text) return text
+  }
+  return ''
+}
+
 function buildSessionSkillInputsByTurn(sessionLogRaw: string): Map<string, SessionRecoveredSkillInput[]> {
   let currentTurnId = ''
   const skillsByTurnId = new Map<string, SessionRecoveredSkillInput[]>()
@@ -760,10 +807,14 @@ function toDirectUserContentBlocks(content: unknown): Record<string, unknown>[] 
   for (const item of content) {
     const record = asRecord(item)
     if (!record) continue
-    if (record.type === 'input_text' && typeof record.text === 'string') {
-      blocks.push({ type: 'text', text: record.text, text_elements: [] })
+    if (isSessionUserTextBlockType(record.type) && typeof record.text === 'string') {
       const skill = parseSessionSkillText(record.text)
-      if (skill) blocks.push({ type: 'skill', name: skill.name, path: skill.path })
+      if (skill) {
+        blocks.push({ type: 'skill', name: skill.name, path: skill.path })
+        continue
+      }
+      if (isSessionInternalInputText(record.text)) continue
+      blocks.push({ type: 'text', text: record.text, text_elements: [] })
       continue
     }
     if (record.type === 'input_image') {
@@ -777,6 +828,34 @@ function toDirectUserContentBlocks(content: unknown): Record<string, unknown>[] 
     }
   }
   return blocks
+}
+
+function appendDirectSkillBlocksToLastUserMessage(
+  builder: DirectSessionTurnBuilder,
+  skillBlocks: Record<string, unknown>[],
+): boolean {
+  if (skillBlocks.length === 0) return false
+  for (let index = builder.items.length - 1; index >= 0; index -= 1) {
+    const item = asRecord(builder.items[index])
+    const content = Array.isArray(item?.content) ? item.content : null
+    if (item?.type !== 'userMessage' || !content) continue
+    const existingSkillPaths = new Set(content.flatMap((contentItem) => {
+      const contentRecord = asRecord(contentItem)
+      const path = readNonEmptyString(contentRecord?.path)
+      return contentRecord?.type === 'skill' && path ? [path] : []
+    }))
+    const missingSkillBlocks = skillBlocks.filter((skillBlock) => {
+      const path = readNonEmptyString(skillBlock.path)
+      return path && !existingSkillPaths.has(path)
+    })
+    if (missingSkillBlocks.length === 0) return true
+    builder.items[index] = {
+      ...item,
+      content: [...content, ...missingSkillBlocks],
+    }
+    return true
+  }
+  return false
 }
 
 function readDirectAssistantText(content: unknown): string {
@@ -800,6 +879,8 @@ function appendDirectMessageItem(builder: DirectSessionTurnBuilder, payload: Rec
   if (role === 'user') {
     const content = toDirectUserContentBlocks(payload.content)
     if (content.length === 0) return
+    const hasVisiblePromptContent = content.some((item) => item.type !== 'skill')
+    if (!hasVisiblePromptContent && appendDirectSkillBlocksToLastUserMessage(builder, content)) return
     builder.items.push({
       type: 'userMessage',
       id: itemId,
@@ -2217,10 +2298,7 @@ function rewriteImportedSession(raw: string, importedCwd: string, importedThread
       }
       lines.push(JSON.stringify(parsed))
       if (!hasUserMessageEvent && payload && record?.type === 'response_item' && readNonEmptyString(payload.role) === 'user') {
-        const content = Array.isArray(payload.content) ? payload.content : []
-        const text = content
-          .map((item) => readNonEmptyString(asRecord(item)?.text))
-          .find((value) => value.length > 0)
+        const text = readVisibleSessionUserTextFromContent(payload.content)
         if (text) {
           lines.push(JSON.stringify({
             timestamp: readNonEmptyString(record.timestamp) || new Date().toISOString(),
@@ -2273,15 +2351,7 @@ function readImportedSessionRecord(raw: string, path: string, cwd: string, fallb
       if (!firstUserMessage && record?.type === 'response_item') {
         const role = readNonEmptyString(payload?.role)
         if (role === 'user') {
-          const content = Array.isArray(payload?.content) ? payload.content : []
-          for (const item of content) {
-            const itemRecord = asRecord(item)
-            const text = readNonEmptyString(itemRecord?.text)
-            if (text) {
-              firstUserMessage = text
-              break
-            }
-          }
+          firstUserMessage = readVisibleSessionUserTextFromContent(payload?.content)
         }
       }
     } catch {
@@ -4045,7 +4115,11 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string>): Map
       orderByTurnId.set(currentTurnId, slots)
     }
 
-    if (payload.type === 'message' && payload.role === 'assistant') {
+    if (
+      payload.type === 'message'
+      && payload.role === 'assistant'
+      && stripDirectMemoryCitationFooter(readDirectAssistantText(payload.content)).length > 0
+    ) {
       slots.push({ type: 'agentMessage' })
       continue
     }

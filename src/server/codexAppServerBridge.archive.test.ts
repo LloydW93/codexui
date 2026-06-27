@@ -565,6 +565,173 @@ MEMORY.md:137-145|note=[phase b account incident workflow context]
     }
   })
 
+  it('hides direct session infrastructure records before rendering transcript output', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codexui-direct-thread-infra-'))
+    const threadId = 'direct-infra-thread'
+    const sessionDir = join(codexHome, 'sessions', '2026', '06', '27')
+    const sessionPath = join(sessionDir, `rollout-2026-06-27T10-00-00-${threadId}.jsonl`)
+    await mkdir(sessionDir, { recursive: true })
+    process.env.CODEX_HOME = codexHome
+
+    const lines = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: threadId,
+          timestamp: '2026-06-27T10:00:00.000Z',
+          cwd: '/workspace/project',
+          cli_version: '0.1.0',
+          source: 'vscode',
+          model_provider: 'proxy',
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-06-27T10:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-visible', started_at: 1782554401 },
+      }),
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 'turn-visible', cwd: '/workspace/project', model: 'gpt-5.5' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/workspace/project</cwd>\n</environment_context>' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text: '<model_switch>\nContinue with the latest instructions.\n</model_switch>' }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-06-27T10:00:02.000Z',
+        type: 'compacted',
+        payload: {
+          message: 'Another language model started to solve this problem and produced a summary of its thinking process. Use this to build on the work that has already been done.',
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-06-27T10:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'context_compacted' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: 'Another language model started to solve this problem and produced a summary of its thinking process. Use this to build on the work that has already been done.',
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '# AGENTS.md instructions for /workspace/project\n\n<INSTRUCTIONS>\nHidden repo instructions.\n</INSTRUCTIONS>',
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'visible request' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '<skill>\n<name>browser-use:browser</name>\n<path>/home/user/.codex/skills/browser/SKILL.md</path>\n</skill>',
+          }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{
+            type: 'output_text',
+            text: `visible answer
+
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:1-2|note=[hidden footer]
+</citation_entries>
+</oai-mem-citation>`,
+          }],
+          phase: 'final_answer',
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '<subagent_notification>\n{"status":{"completed":"done"}}\n</subagent_notification>' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-visible',
+          completed_at: 1782554403,
+          duration_ms: 2000,
+        },
+      }),
+    ]
+    await writeFile(sessionPath, `${lines.join('\n')}\n`, 'utf8')
+
+    try {
+      const page = await readDirectSessionThreadTurnPage(threadId, '', 10)
+      const result = page?.result as { thread?: { preview?: string; turns?: Array<{ items: Array<Record<string, unknown>> }> } }
+      const items = result.thread?.turns?.[0]?.items ?? []
+
+      expect(result.thread?.preview).toBe('visible request')
+      expect(items.map((item) => item.type)).toEqual(['userMessage', 'agentMessage'])
+      expect(items[0]?.content).toEqual([
+        { type: 'text', text: 'visible request', text_elements: [] },
+        { type: 'skill', name: 'browser-use:browser', path: '/home/user/.codex/skills/browser/SKILL.md' },
+      ])
+      expect(items[1]?.text).toBe('visible answer')
+      expect(JSON.stringify(items)).not.toContain('subagent_notification')
+      expect(JSON.stringify(items)).not.toContain('turn_aborted')
+      expect(JSON.stringify(items)).not.toContain('environment_context')
+      expect(JSON.stringify(items)).not.toContain('Another language model started')
+      expect(JSON.stringify(items)).not.toContain('oai-mem-citation')
+      expect(JSON.stringify(items)).not.toContain('Hidden repo instructions')
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('does not expose unfinished direct session turns as active without live stream evidence', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codexui-direct-thread-orphan-'))
     const threadId = 'direct-orphan-thread'
